@@ -15,6 +15,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.log
-MESSAGE_CLAUDE_CODE.py
 results/*
 !results/.gitkeep
