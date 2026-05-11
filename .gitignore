@@ -1,0 +1,12 @@
+venv/
+data/
+models/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.parquet
+*.pkl
+.claude/
+build.log
+results/*
+!results/.gitkeep
