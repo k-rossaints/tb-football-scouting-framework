@@ -5,9 +5,13 @@ extraction.py — Téléchargement et chargement des données StatsBomb brutes.
 import os
 import glob
 import traceback
+from pathlib import Path
 
 import pandas as pd
 import statsbombpy.sb as sb
+
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_RAW = PROJECT_ROOT / 'data' / 'raw'
 
 COMPETITIONS_TO_USE = [
     {'name': 'La Liga 2015/16',        'competition_id': 11, 'season_id': 27},
@@ -18,7 +22,7 @@ COMPETITIONS_TO_USE = [
 ]
 
 
-def extract_and_save(competitions_list=None, output_dir='C:/tb-scouting/data/raw/'):
+def extract_and_save(competitions_list=None, output_dir=DATA_RAW):
     """Télécharge les events et lineups StatsBomb et les sauvegarde en parquet.
 
     Pour chaque compétition de `competitions_list`, charge la liste des matchs
@@ -122,7 +126,7 @@ def extract_and_save(competitions_list=None, output_dir='C:/tb-scouting/data/raw
     print('\n[DONE] Extraction terminée.')
 
 
-def load_raw_events(raw_dir='C:/tb-scouting/data/raw/'):
+def load_raw_events(raw_dir=DATA_RAW):
     """Charge et concatène tous les fichiers events parquet en un seul DataFrame.
 
     Args:
@@ -155,7 +159,7 @@ def load_raw_events(raw_dir='C:/tb-scouting/data/raw/'):
     return df
 
 
-def load_raw_lineups(raw_dir='C:/tb-scouting/data/raw/'):
+def load_raw_lineups(raw_dir=DATA_RAW):
     """Charge et concatène tous les fichiers lineups parquet en un seul DataFrame.
 
     Args:

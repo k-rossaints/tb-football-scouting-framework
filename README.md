@@ -29,7 +29,7 @@ StatsBomb Open Data
         ↓
   K-Means Clustering    → src/clustering.py   (role profile discovery)
         ↓
-  Tactical Matching     → src/matching.py     (cosine similarity, 0-100 score)
+  Tactical Matching     → src/matching.py     (weighted percentile rank, 0-100 score)
         ↓
   Visualisation         → src/visualisation.py (radar charts, rankings)
 ```
@@ -53,6 +53,26 @@ venv\Scripts\activate         # Windows
 pip install -r requirements.txt
 ```
 
+## Reproducing the data pipeline
+
+The repository ships with code and configuration but **not the data artefacts**
+(`data/`, `models/`, generated `results/`) — they are listed in `.gitignore`
+because they are large and trivially reproducible from the open StatsBomb
+dataset. After installation, run the pipeline once to regenerate them:
+
+```python
+from src.extraction import extract_and_save
+from src.features  import build_features
+from src.clustering import run_clustering
+
+extract_and_save()    # downloads StatsBomb events for the 5 leagues 2015/16
+build_features()      # writes data/processed/player_features.parquet
+run_clustering()      # writes data/processed/player_clustered.parquet + models/
+```
+
+All paths are resolved via `pathlib` from the project root, so the workflow
+runs identically on Windows, macOS, and Linux without any path edits.
+
 ## Usage
 
 ```python
@@ -61,9 +81,9 @@ from src.matching import rank_players_by_role
 
 # Find the best ball-playing centre-backs
 results = rank_players_by_role(
-    role="ball_playing_cb",
+    role_name="ball_playing_defender",
     position="CB",
-    min_minutes=450
+    min_minutes=450,
 )
 print(results.head(10))
 ```
@@ -88,7 +108,7 @@ tb-football-scouting-framework/
 │   ├── extraction.py         ← Data extraction pipeline
 │   ├── features.py           ← Metric calculation per player per 90
 │   ├── clustering.py         ← Normalisation, PCA, K-Means
-│   ├── matching.py           ← Cosine similarity, scoring, ranking
+│   ├── matching.py           ← Weighted percentile scoring, ranking, similarity
 │   └── visualisation.py      ← Radar charts, tables, scatter plots
 ├── config/
 │   └── role_profiles.yaml    ← Tactical role definitions (weights)
@@ -107,9 +127,9 @@ of metrics in `config/role_profiles.yaml`.
 |----------|-------|
 | CB | Ball-Playing Defender, No-Nonsense CB, Aerial Dominant CB |
 | FB | Complete Wing-Back, Inverted Wing-Back, Defensive Full-Back |
-| MF | Deep-Lying Playmaker, Ball-Winning Midfielder, Box-to-Box |
+| MF | Deep-Lying Playmaker, Ball-Winning Midfielder, Box-to-Box, Mezzala |
 | AM | Advanced Playmaker, Inside Forward, Pressing Winger |
-| ST | Advanced Forward, Pressing Forward, Poacher |
+| ST | Advanced Forward, Pressing Forward, Poacher, Deep-Lying Forward |
 
 ## License
 

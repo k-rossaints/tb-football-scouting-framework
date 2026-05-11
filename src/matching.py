@@ -19,11 +19,16 @@ gère la traduction et la robustesse aux métriques non disponibles.
 
 import os
 import unicodedata
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yaml
 from sklearn.preprocessing import MinMaxScaler
+
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_PROCESSED = PROJECT_ROOT / 'data' / 'processed'
+CONFIG_DIR = PROJECT_ROOT / 'config'
 
 
 def _strip_accents(s):
@@ -45,9 +50,8 @@ def _name_match(series, query):
 # Chemins par défaut
 # ---------------------------------------------------------------------------
 
-ROOT = 'C:/tb-scouting'
-DEFAULT_CLUSTERED = os.path.join(ROOT, 'data', 'processed', 'player_clustered.parquet')
-DEFAULT_PROFILES  = os.path.join(ROOT, 'config', 'role_profiles.yaml')
+DEFAULT_CLUSTERED = DATA_PROCESSED / 'player_clustered.parquet'
+DEFAULT_PROFILES  = CONFIG_DIR / 'role_profiles.yaml'
 
 IDEAL_PERCENTILE = 75        # le rôle "idéal" = 75e centile (top quartile)
                              # (réf. réaliste : un excellent joueur typique,

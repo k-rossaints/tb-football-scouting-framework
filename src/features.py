@@ -14,9 +14,14 @@ Pas de boucle sur les lignes : tout est vectorisé via groupby/merge_asof.
 
 import os
 import glob
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_RAW = PROJECT_ROOT / 'data' / 'raw'
+DATA_PROCESSED = PROJECT_ROOT / 'data' / 'processed'
 
 
 # ---------------------------------------------------------------------------
@@ -732,8 +737,7 @@ def _reduce_meta(meta_counts):
     return name.merge(team, on='player_id', how='left')
 
 
-def build_features(raw_dir='C:/tb-scouting/data/raw/',
-                   output_dir='C:/tb-scouting/data/processed/'):
+def build_features(raw_dir=DATA_RAW, output_dir=DATA_PROCESSED):
     """Construit la table de features joueurs et la sauvegarde en parquet.
 
     Pour rester dans une enveloppe mémoire raisonnable (~6M events au total),

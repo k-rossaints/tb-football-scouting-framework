@@ -12,6 +12,7 @@ Toutes les sorties sont exportables en PNG 300 DPI dans le dossier
 """
 
 import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -22,13 +23,15 @@ from mplsoccer import Radar
 
 from src import matching as _m
 
+PROJECT_ROOT = Path(__file__).parent.parent
+RESULTS_DIR = PROJECT_ROOT / 'results'
+
 
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
 
-ROOT = 'C:/tb-scouting'
-RESULTS_DIR = os.path.join(ROOT, 'results')
+# (PROJECT_ROOT et RESULTS_DIR définis en haut du fichier)
 
 COLOR_PLAYER = '#1f77b4'   # bleu
 COLOR_IDEAL = '#d62728'    # rouge

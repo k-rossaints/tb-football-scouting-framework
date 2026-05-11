@@ -15,12 +15,17 @@ Sortie :
 
 import os
 import pickle
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_PROCESSED = PROJECT_ROOT / 'data' / 'processed'
+MODELS_DIR = PROJECT_ROOT / 'models'
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +253,8 @@ def _print_cluster_report(pos, fit, df_group):
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def run_clustering(features_path='C:/tb-scouting/data/processed/player_features.parquet',
-                   output_dir='C:/tb-scouting/'):
+def run_clustering(features_path=DATA_PROCESSED / 'player_features.parquet',
+                   output_dir=PROJECT_ROOT):
     """Lance le clustering complet position par position.
 
     Étapes pour chaque groupe ∈ {CB, FB, MF, AM, ST} :
