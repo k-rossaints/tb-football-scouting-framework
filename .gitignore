@@ -17,3 +17,7 @@ Thumbs.db
 *.log
 results/*
 !results/.gitkeep
+# README "Visual Examples" — committed on purpose
+!results/uc1_radar_bpd_top1.png
+!results/uc1_ranking_bpd.png
+!results/uc3_card_modric_natural.png

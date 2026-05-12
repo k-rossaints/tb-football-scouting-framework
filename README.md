@@ -90,6 +90,38 @@ print(results.head(10))
 
 See `notebooks/04_demo.ipynb` for full use case demonstrations.
 
+## Visual Examples
+
+Three representative outputs from `notebooks/04_demo.ipynb`. Every figure is
+generated programmatically from the scoring engine and exported at 300 DPI.
+
+### Top-10 ranking table — Ball-Playing Defenders (2015/16)
+
+Players are scored against the `ball_playing_defender` role profile and
+ranked by their weighted-percentile match score. The score column uses a
+green gradient so that the spread within the shortlist is visible at a
+glance.
+
+![Top 10 ball-playing defenders](results/uc1_ranking_bpd.png)
+
+### Radar chart — top-ranked player vs the role reference
+
+For any player and any role, the radar chart contrasts the player's
+intra-position MinMax-normalised metric profile (blue) with the 75th-
+percentile reference of the same position (red dashed). The title carries
+the weighted-percentile match score that drove the ranking.
+
+![Ball-playing defender radar](results/uc1_radar_bpd_top1.png)
+
+### Player card — Luka Modrić, natural role detection
+
+The player card consolidates the diagnostic output in a single
+A4-landscape sheet: radar against the player's empirically detected
+natural role, top strengths and weaknesses vs the reference, the
+data-driven cluster label, and the three closest stylistic neighbours.
+
+![Modrić player card](results/uc3_card_modric_natural.png)
+
 ## Project Structure
 
 ```

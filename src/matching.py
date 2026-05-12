@@ -628,6 +628,97 @@ def profile_player(player_name, position=None, verbose=True):
 
 
 # ---------------------------------------------------------------------------
+# Public API: compare_players
+# ---------------------------------------------------------------------------
+
+def compare_players(player1_name, player2_name, position, metrics=None,
+                    top_variance=10):
+    """Side-by-side percentile comparison of two players on key metrics.
+
+    Both players are looked up (accent-insensitive) within the supplied
+    ``position`` group; their percentile ranks within that group are then
+    placed in a tidy DataFrame.
+
+    If ``metrics`` is None, the comparison is built on the ``top_variance``
+    most discriminative metrics for the position — defined here as the
+    metrics whose MinMax-normalised values have the highest variance across
+    the position population. (Note that percentile ranks themselves cannot
+    be used to pick discriminative metrics — by construction their
+    distribution is uniform and their variance is constant.)
+
+    Args:
+        player1_name: Name (fragment) of the first player.
+        player2_name: Name (fragment) of the second player.
+        position: Position code (CB, FB, MF, AM, ST). Both players must
+            belong to this group; otherwise a ValueError is raised.
+        metrics: Optional list of metric names. Names accept both
+            ``_p90`` and ``_per90`` suffixes; rate columns have no suffix.
+            Unknown names are warned and dropped.
+        top_variance: How many metrics to keep when ``metrics`` is None
+            (default 10).
+
+    Returns:
+        DataFrame indexed by metric name with columns:
+        ``{player1_name}_pct``, ``{player2_name}_pct``, ``diff`` (player1
+        minus player2). Sorted by absolute diff descending so the metrics
+        that *most* distinguish the two players appear first.
+    """
+    df, _ = _load_data()
+
+    # Locate both players within the requested position
+    def _locate(name):
+        mask = _name_match(df['player_name'], name)
+        mask &= df['position_group'] == position
+        cand = df[mask]
+        if cand.empty:
+            raise KeyError(f'No player matches "{name}" at position {position}.')
+        return cand.sort_values('minutes_total', ascending=False).iloc[0]
+
+    p1 = _locate(player1_name)
+    p2 = _locate(player2_name)
+    if p1['player_id'] == p2['player_id']:
+        raise ValueError('player1 and player2 resolved to the same player.')
+
+    pct_df, all_cols = _get_percentile_ranks(position)
+
+    # Resolve / pick the comparison metrics
+    if metrics is None:
+        norm_df, _ = _get_normalized(position)
+        variances = norm_df[all_cols].var().sort_values(ascending=False)
+        chosen = list(variances.head(top_variance).index)
+    else:
+        chosen = []
+        missing = []
+        for m in metrics:
+            col = _resolve_metric(m, all_cols)
+            if col is None:
+                missing.append(m)
+            else:
+                chosen.append(col)
+        if missing:
+            print(f'[warn] compare_players: dropped unknown metric(s) — {missing}')
+        if not chosen:
+            raise ValueError('None of the supplied metrics could be resolved.')
+
+    p1_pct = pct_df.loc[p1['player_id'], chosen].astype('float64')
+    p2_pct = pct_df.loc[p2['player_id'], chosen].astype('float64')
+
+    short1 = p1['player_name'].split()[-1]
+    short2 = p2['player_name'].split()[-1]
+    c1 = f'{short1}_pct'
+    c2 = f'{short2}_pct'
+
+    out = pd.DataFrame({
+        c1: p1_pct.round(1),
+        c2: p2_pct.round(1),
+    })
+    out['diff'] = (out[c1] - out[c2]).round(1)
+    out = out.reindex(out['diff'].abs().sort_values(ascending=False).index)
+    out.index.name = 'metric'
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public API: list_available_metrics
 # ---------------------------------------------------------------------------
 
