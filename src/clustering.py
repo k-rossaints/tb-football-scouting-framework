@@ -1,16 +1,20 @@
 """
-clustering.py — Clustering non supervisé par groupe de position.
+clustering.py — Unsupervised clustering per position group.
 
-Pour chaque groupe (CB, FB, MF, AM, ST), on construit indépendamment :
-    1. Une matrice de features (uniquement _p90 + taux, pas de totaux bruts).
-    2. Une standardisation (StandardScaler).
-    3. Une réduction PCA gardant 80% de la variance expliquée.
-    4. Un KMeans dont le k est choisi par méthode du coude (k de 2 à 8).
+For each group (CB, FB, MF, AM, ST), an independent pipeline is fitted:
+    1. Build a feature matrix (only ``*_p90`` columns + rate columns —
+       raw counts are excluded so a player's minutes total does not bias
+       the clustering).
+    2. Standardise (StandardScaler).
+    3. Reduce dimensionality with PCA, keeping 80% of the variance.
+    4. Cluster with KMeans, k chosen by the elbow method (k tested 2..8).
 
-Sortie :
-    - models/scaler_{POS}.pkl, pca_{POS}.pkl, kmeans_{POS}.pkl
-    - data/processed/player_clustered.parquet (avec colonnes cluster, pca_1, pca_2)
-    - Affichage console : top métriques + top 5 joueurs par cluster.
+Outputs:
+    - models/{scaler,pca,kmeans}_{POS}.pkl (one of each per position)
+    - data/processed/player_clustered.parquet (with cluster, pca_1, pca_2,
+      role_label columns)
+    - Console report: characteristic metrics and representative players
+      for each cluster.
 """
 
 import os
@@ -29,7 +33,7 @@ MODELS_DIR = PROJECT_ROOT / 'models'
 
 
 # ---------------------------------------------------------------------------
-# Constantes
+# Constants
 # ---------------------------------------------------------------------------
 
 POSITION_GROUPS = ['CB', 'FB', 'MF', 'AM', 'ST']
@@ -52,21 +56,21 @@ RANDOM_STATE = 42
 
 
 # ---------------------------------------------------------------------------
-# Sélection de features
+# Feature selection
 # ---------------------------------------------------------------------------
 
 def select_feature_columns(df):
-    """Détermine les colonnes utilisées pour le clustering.
+    """Return the columns used for clustering.
 
-    Retient uniquement les colonnes ``*_p90`` et les colonnes de taux listées
-    dans :data:`RATE_COLUMNS`. Exclut les totaux bruts (counts non normalisés)
-    pour éviter que la durée de jeu d'un joueur ne biaise le clustering.
+    Keeps only ``*_p90`` columns plus the rate columns in :data:`RATE_COLUMNS`.
+    Raw counts are excluded so the clustering does not reflect playing-time
+    differences between regulars and rotation players.
 
     Args:
-        df (pd.DataFrame): la table de features joueurs.
+        df: Player feature table.
 
     Returns:
-        list[str]: noms des colonnes à utiliser.
+        List of column names to feed into the pipeline.
     """
     p90_cols = [c for c in df.columns if c.endswith('_p90')]
     rate_cols = [c for c in RATE_COLUMNS if c in df.columns]
@@ -74,56 +78,52 @@ def select_feature_columns(df):
 
 
 # ---------------------------------------------------------------------------
-# Méthode du coude
+# Elbow method
 # ---------------------------------------------------------------------------
 
 def find_elbow_k(inertias, k_values):
-    """Trouve le k optimal par méthode du coude (kneedle / distance à la corde).
+    """Pick the optimal k via the kneedle / distance-to-chord method.
 
-    Pour chaque point (k, inertia), on calcule sa distance perpendiculaire à
-    la droite reliant le premier et le dernier point de la courbe. Le coude
-    est le point qui maximise cette distance — c'est-à-dire l'endroit où la
-    courbe s'écarte le plus de la ligne droite, donc où elle "plafonne".
+    For each point (k, inertia), compute its perpendicular distance to the
+    line joining the first and last point of the curve. The elbow is the
+    point that maximises this distance — where the curve deviates the
+    most from the straight line, i.e. where it starts plateauing.
 
     Args:
-        inertias (list[float]): inerties KMeans pour chaque k testé.
-        k_values (list[int]): valeurs de k correspondantes.
+        inertias: KMeans inertia for each tested k.
+        k_values: Matching k values.
 
     Returns:
-        int: la valeur de k optimale.
+        The optimal k.
     """
     pts = np.column_stack([k_values, inertias]).astype(float)
-    # Vecteur ligne entre premier et dernier point
     p0, p1 = pts[0], pts[-1]
     line_vec = p1 - p0
     line_norm = np.linalg.norm(line_vec)
     if line_norm == 0:
         return int(k_values[0])
-    # Distance perpendiculaire de chaque point à la corde
+    # Perpendicular distance from each point to the chord (2D cross product)
     rel = pts - p0
-    # Produit vectoriel 2D = norm(rel x line)
     cross = np.abs(rel[:, 0] * line_vec[1] - rel[:, 1] * line_vec[0])
     distances = cross / line_norm
-    best_idx = int(np.argmax(distances))
-    return int(k_values[best_idx])
+    return int(k_values[int(np.argmax(distances))])
 
 
 # ---------------------------------------------------------------------------
-# Pipeline par groupe de position
+# Per-position pipeline
 # ---------------------------------------------------------------------------
 
 def _fit_position_group(df_group, feature_cols):
-    """Entraîne scaler + PCA + KMeans pour un groupe de position donné.
+    """Fit scaler + PCA + KMeans for a single position group.
 
     Args:
-        df_group (pd.DataFrame): sous-ensemble des joueurs d'un groupe.
-        feature_cols (list[str]): colonnes à utiliser.
+        df_group: Subset of players for this position.
+        feature_cols: Columns to use.
 
     Returns:
-        dict: ``{scaler, pca, kmeans, k, inertias, X_scaled, X_pca, labels,
-        feature_cols}``.
+        Dict with the fitted artefacts and intermediate arrays.
     """
-    # Imputation : taux NaN (ex. xG_per_shot sans tir) → 0, p90 NaN → 0
+    # Impute NaNs (e.g. xG_per_shot for a player with no shots) with 0
     X = df_group[feature_cols].astype('float64').fillna(0.0).to_numpy()
 
     scaler = StandardScaler()
@@ -133,7 +133,7 @@ def _fit_position_group(df_group, feature_cols):
               random_state=RANDOM_STATE)
     X_pca = pca.fit_transform(X_scaled)
 
-    # Recherche du k optimal
+    # Search for the optimal k
     k_values = list(range(K_MIN, K_MAX + 1))
     inertias = []
     for k in k_values:
@@ -142,7 +142,7 @@ def _fit_position_group(df_group, feature_cols):
         inertias.append(km.inertia_)
     best_k = find_elbow_k(inertias, k_values)
 
-    # Modèle final
+    # Final model with more inits for stability
     kmeans = KMeans(n_clusters=best_k, random_state=RANDOM_STATE, n_init=20)
     labels = kmeans.fit_predict(X_pca)
 
@@ -161,49 +161,44 @@ def _fit_position_group(df_group, feature_cols):
 
 
 def _save_pickle(obj, path):
-    """Sérialise ``obj`` dans ``path`` via pickle (protocole le plus récent).
-
-    Args:
-        obj: objet picklable.
-        path (str): chemin de destination.
-    """
+    """Serialise ``obj`` to ``path`` using the highest pickle protocol."""
     with open(path, 'wb') as f:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 # ---------------------------------------------------------------------------
-# Description des clusters
+# Cluster description
 # ---------------------------------------------------------------------------
 
 def _describe_cluster(fit, df_group, cluster_id, top_n_metrics=3, top_n_players=5):
-    """Identifie les métriques caractéristiques et les joueurs représentatifs.
+    """Identify the characteristic metrics and the representative players.
 
-    Métriques caractéristiques : on calcule la moyenne z-scorée du cluster sur
-    chaque feature (l'espace standardisé a déjà ``mean=0, std=1`` au global),
-    puis on trie par valeur absolue décroissante.
+    Characteristic metrics: since the input space is standardised
+    (``mean=0, std=1`` globally), the cluster mean on each feature is
+    directly a z-score relative to the position. The features are ranked
+    by absolute z-score.
 
-    Joueurs représentatifs : distance euclidienne au centroïde dans l'espace
-    PCA — les 5 plus proches.
+    Representative players: Euclidean distance to the cluster centroid in
+    PCA space — the closest players are returned.
 
     Args:
-        fit (dict): sortie de :func:`_fit_position_group`.
-        df_group (pd.DataFrame): joueurs du groupe (même ordre que fit).
-        cluster_id (int): identifiant du cluster.
-        top_n_metrics (int): nombre de métriques à retourner.
-        top_n_players (int): nombre de joueurs à retourner.
+        fit: Output of :func:`_fit_position_group`.
+        df_group: Players in this group (same order as ``fit['labels']``).
+        cluster_id: Cluster index.
+        top_n_metrics: How many top metrics to return.
+        top_n_players: How many top players to return.
 
     Returns:
-        dict: ``{metrics: [(name, z), ...], players: [(name, team, dist), ...]}``
+        Dict ``{metrics, players, size}``.
     """
     mask = fit['labels'] == cluster_id
-    Xs = fit['X_scaled'][mask]  # déjà standardisé sur tout le groupe
+    Xs = fit['X_scaled'][mask]
     cluster_means = Xs.mean(axis=0)
 
     feature_cols = fit['feature_cols']
     order = np.argsort(-np.abs(cluster_means))[:top_n_metrics]
     metrics = [(feature_cols[i], float(cluster_means[i])) for i in order]
 
-    # Distance au centroïde en espace PCA
     centroid = fit['kmeans'].cluster_centers_[cluster_id]
     Xp = fit['X_pca'][mask]
     dists = np.linalg.norm(Xp - centroid, axis=1)
@@ -220,26 +215,19 @@ def _describe_cluster(fit, df_group, cluster_id, top_n_metrics=3, top_n_players=
 
 
 def _print_cluster_report(pos, fit, df_group):
-    """Affiche le rapport texte des clusters d'un groupe de position.
-
-    Args:
-        pos (str): code de groupe (ex. 'CB').
-        fit (dict): sortie de :func:`_fit_position_group`.
-        df_group (pd.DataFrame): joueurs du groupe.
-    """
-    print(f'\n=== {pos} — {len(df_group)} joueurs, k={fit["k"]} '
+    """Print the cluster summary for one position group."""
+    print(f'\n=== {pos} — {len(df_group)} players, k={fit["k"]} '
           f'(inertias {[round(x, 1) for x in fit["inertias"]]}) ===')
-    print(f'    PCA : {fit["pca"].n_components_} composantes, '
-          f'variance expliquée = {fit["pca"].explained_variance_ratio_.sum():.2%}')
+    print(f'    PCA: {fit["pca"].n_components_} components, '
+          f'explained variance = {fit["pca"].explained_variance_ratio_.sum():.2%}')
 
     for cid in range(fit['k']):
         desc = _describe_cluster(fit, df_group, cid)
-        print(f'\n  -- Cluster {cid} ({desc["size"]} joueurs) --')
-        print('     Métriques caractéristiques :')
+        print(f'\n  -- Cluster {cid} ({desc["size"]} players) --')
+        print('     Characteristic metrics:')
         for name, z in desc['metrics']:
-            sign = '+' if z >= 0 else ''
-            print(f'       {sign}{z:+.2f} sd   {name}')
-        print('     Joueurs représentatifs :')
+            print(f'       {z:+.2f} sd   {name}')
+        print('     Representative players:')
         for name, team, dist in desc['players']:
             try:
                 print(f'       - {name} ({team})  d={dist:.2f}')
@@ -255,26 +243,26 @@ def _print_cluster_report(pos, fit, df_group):
 
 def run_clustering(features_path=DATA_PROCESSED / 'player_features.parquet',
                    output_dir=PROJECT_ROOT):
-    """Lance le clustering complet position par position.
+    """Run the full clustering pipeline, position by position.
 
-    Étapes pour chaque groupe ∈ {CB, FB, MF, AM, ST} :
-        1. Filtre la sous-population.
-        2. Sélectionne les colonnes _p90 et de taux.
-        3. Standardise → PCA 80% var → KMeans (k optimal par coude, k∈[2,8]).
-        4. Sauvegarde scaler/pca/kmeans dans ``{output_dir}/models/``.
-        5. Affiche métriques caractéristiques et joueurs représentatifs.
+    For each group ∈ {CB, FB, MF, AM, ST}:
+        1. Filter the sub-population.
+        2. Select ``*_p90`` and rate columns.
+        3. Standardise → PCA (80% variance) → KMeans (elbow-chosen k ∈ [2, 8]).
+        4. Save scaler / pca / kmeans to ``{output_dir}/models/``.
+        5. Print characteristic metrics and representative players.
 
-    À la fin, la table complète est augmentée des colonnes ``cluster``,
-    ``pca_1``, ``pca_2`` (et ``role_label`` = "{POS}-{cluster}") et écrite
-    dans ``{output_dir}/data/processed/player_clustered.parquet``.
+    The full table is then augmented with ``cluster``, ``pca_1``, ``pca_2``,
+    ``role_label`` (= ``"{POS}-{cluster}"``) and written to
+    ``{output_dir}/data/processed/player_clustered.parquet``.
 
     Args:
-        features_path (str): chemin du parquet de features joueurs.
-        output_dir (str): racine du projet (contient ``models/`` et
+        features_path: Path to the player feature parquet.
+        output_dir: Project root (must contain ``models/`` and
             ``data/processed/``).
 
     Returns:
-        pd.DataFrame: la table augmentée écrite sur disque.
+        The augmented DataFrame written to disk.
     """
     models_dir = os.path.join(output_dir, 'models')
     processed_dir = os.path.join(output_dir, 'data', 'processed')
@@ -284,11 +272,10 @@ def run_clustering(features_path=DATA_PROCESSED / 'player_features.parquet',
     print(f'[load] {features_path}')
     df = pd.read_parquet(features_path)
     feature_cols = select_feature_columns(df)
-    print(f'[features] {len(feature_cols)} colonnes utilisées '
-          f'({sum(c.endswith("_p90") for c in feature_cols)} per90 '
-          f'+ {len(feature_cols) - sum(c.endswith("_p90") for c in feature_cols)} taux)')
+    n_p90 = sum(c.endswith('_p90') for c in feature_cols)
+    print(f'[features] {len(feature_cols)} columns used '
+          f'({n_p90} per-90 + {len(feature_cols) - n_p90} rates)')
 
-    # Colonnes à remplir dans le df final
     df = df.copy()
     df['cluster'] = -1
     df['pca_1'] = np.nan
@@ -298,18 +285,16 @@ def run_clustering(features_path=DATA_PROCESSED / 'player_features.parquet',
     for pos in POSITION_GROUPS:
         sub = df[df['position_group'] == pos]
         if len(sub) < K_MAX + 1:
-            print(f'[skip] {pos} : seulement {len(sub)} joueurs, '
-                  f'pas assez pour tester k jusqu\'à {K_MAX}.')
+            print(f'[skip] {pos}: only {len(sub)} players — too few to test '
+                  f'k up to {K_MAX}.')
             continue
 
         fit = _fit_position_group(sub, feature_cols)
 
-        # Sauvegarde des artefacts
         _save_pickle(fit['scaler'], os.path.join(models_dir, f'scaler_{pos}.pkl'))
         _save_pickle(fit['pca'],    os.path.join(models_dir, f'pca_{pos}.pkl'))
         _save_pickle(fit['kmeans'], os.path.join(models_dir, f'kmeans_{pos}.pkl'))
 
-        # Remontée dans le df principal
         df.loc[sub.index, 'cluster'] = fit['labels']
         df.loc[sub.index, 'pca_1'] = fit['X_pca'][:, 0]
         if fit['X_pca'].shape[1] >= 2:
@@ -318,11 +303,10 @@ def run_clustering(features_path=DATA_PROCESSED / 'player_features.parquet',
 
         _print_cluster_report(pos, fit, sub)
 
-    # Sauvegarde finale
     out_path = os.path.join(processed_dir, 'player_clustered.parquet')
     df.to_parquet(out_path, index=False)
-    print(f'\n[DONE] -> {out_path}  ({len(df)} joueurs, '
-          f'{df["cluster"].ne(-1).sum()} clustérisés)')
+    print(f'\n[DONE] -> {out_path}  ({len(df)} players, '
+          f'{df["cluster"].ne(-1).sum()} clustered)')
     return df
 
 

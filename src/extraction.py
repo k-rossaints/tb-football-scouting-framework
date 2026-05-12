@@ -1,5 +1,8 @@
 """
-extraction.py — Téléchargement et chargement des données StatsBomb brutes.
+extraction.py — Download and load raw StatsBomb event/lineup data.
+
+Idempotent: existing parquet files are skipped, so re-running after a partial
+failure resumes where it stopped.
 """
 
 import os
@@ -23,18 +26,17 @@ COMPETITIONS_TO_USE = [
 
 
 def extract_and_save(competitions_list=None, output_dir=DATA_RAW):
-    """Télécharge les events et lineups StatsBomb et les sauvegarde en parquet.
+    """Download StatsBomb events and lineups, save one parquet per competition.
 
-    Pour chaque compétition de `competitions_list`, charge la liste des matchs
-    via statsbombpy, puis pour chaque match récupère les events et les lineups.
-    Les données sont agrégées par compétition/saison et écrites en parquet dans
-    `output_dir`. Un fichier déjà présent est ignoré (pas de re-téléchargement).
+    For each competition in ``competitions_list``, fetch the match list via
+    ``statsbombpy``, then iterate matches to pull events and lineups. Results
+    are aggregated by (competition, season) and written as parquet to
+    ``output_dir``. Existing files are skipped (no re-download).
 
     Args:
-        competitions_list (list[dict] | None): Liste de dicts avec les clés
-            ``name``, ``competition_id`` et ``season_id``. Si None, utilise
-            :data:`COMPETITIONS_TO_USE`.
-        output_dir (str): Répertoire de destination des fichiers parquet.
+        competitions_list: List of ``{name, competition_id, season_id}`` dicts.
+            Defaults to :data:`COMPETITIONS_TO_USE`.
+        output_dir: Destination directory for the parquet files.
     """
     if competitions_list is None:
         competitions_list = COMPETITIONS_TO_USE
@@ -53,7 +55,7 @@ def extract_and_save(competitions_list=None, output_dir=DATA_RAW):
         lineups_done = os.path.exists(lineups_path)
 
         if events_done and lineups_done:
-            print(f'[SKIP] {name} — fichiers déjà présents.')
+            print(f'[SKIP] {name} — files already present.')
             continue
 
         print(f'\n[START] {name} (competition_id={cid}, season_id={sid})')
@@ -61,16 +63,16 @@ def extract_and_save(competitions_list=None, output_dir=DATA_RAW):
         try:
             matches = sb.matches(competition_id=cid, season_id=sid)
         except Exception:
-            print(f'  [ERROR] Impossible de charger les matchs pour {name}:')
+            print(f'  [ERROR] Could not load matches for {name}:')
             traceback.print_exc()
             continue
 
         if matches is None or matches.empty:
-            print(f'  [WARN] Aucun match trouvé pour {name}.')
+            print(f'  [WARN] No matches found for {name}.')
             continue
 
         match_ids = matches['match_id'].tolist()
-        print(f'  {len(match_ids)} matchs trouvés.')
+        print(f'  {len(match_ids)} matches found.')
 
         all_events  = []
         all_lineups = []
@@ -91,7 +93,7 @@ def extract_and_save(competitions_list=None, output_dir=DATA_RAW):
             if not lineups_done:
                 try:
                     raw_lineups = sb.lineups(match_id=mid)
-                    # lineups() renvoie un dict {équipe: DataFrame}
+                    # sb.lineups() returns a dict {team_name: DataFrame}
                     frames = []
                     for team_name, df in raw_lineups.items():
                         df = df.copy()
@@ -109,38 +111,37 @@ def extract_and_save(competitions_list=None, output_dir=DATA_RAW):
             try:
                 df_events = pd.concat(all_events, ignore_index=True)
                 df_events.to_parquet(events_path, index=False)
-                print(f'  [SAVED] {events_path} ({len(df_events)} lignes)')
+                print(f'  [SAVED] {events_path} ({len(df_events)} rows)')
             except Exception:
-                print(f'  [ERROR] Sauvegarde events {name}:')
+                print(f'  [ERROR] Saving events for {name}:')
                 traceback.print_exc()
 
         if not lineups_done and all_lineups:
             try:
                 df_lineups = pd.concat(all_lineups, ignore_index=True)
                 df_lineups.to_parquet(lineups_path, index=False)
-                print(f'  [SAVED] {lineups_path} ({len(df_lineups)} lignes)')
+                print(f'  [SAVED] {lineups_path} ({len(df_lineups)} rows)')
             except Exception:
-                print(f'  [ERROR] Sauvegarde lineups {name}:')
+                print(f'  [ERROR] Saving lineups for {name}:')
                 traceback.print_exc()
 
-    print('\n[DONE] Extraction terminée.')
+    print('\n[DONE] Extraction complete.')
 
 
 def load_raw_events(raw_dir=DATA_RAW):
-    """Charge et concatène tous les fichiers events parquet en un seul DataFrame.
+    """Load and concatenate all ``events_*.parquet`` files into one DataFrame.
 
     Args:
-        raw_dir (str): Répertoire contenant les fichiers ``events_*.parquet``.
+        raw_dir: Directory containing the parquet files.
 
     Returns:
-        pd.DataFrame: DataFrame consolidé de tous les events. Vide si aucun
-        fichier n'est trouvé.
+        Combined DataFrame, or empty DataFrame if no file is found.
     """
     pattern = os.path.join(raw_dir, 'events_*.parquet')
     files = sorted(glob.glob(pattern))
 
     if not files:
-        print(f'[WARN] Aucun fichier events trouvé dans {raw_dir}')
+        print(f'[WARN] No events file found in {raw_dir}')
         return pd.DataFrame()
 
     frames = []
@@ -148,32 +149,31 @@ def load_raw_events(raw_dir=DATA_RAW):
         try:
             frames.append(pd.read_parquet(path))
         except Exception:
-            print(f'[ERROR] Lecture {path}:')
+            print(f'[ERROR] Reading {path}:')
             traceback.print_exc()
 
     if not frames:
         return pd.DataFrame()
 
     df = pd.concat(frames, ignore_index=True)
-    print(f'[LOAD] {len(files)} fichier(s) events — {len(df)} lignes au total.')
+    print(f'[LOAD] {len(files)} events file(s) — {len(df)} rows total.')
     return df
 
 
 def load_raw_lineups(raw_dir=DATA_RAW):
-    """Charge et concatène tous les fichiers lineups parquet en un seul DataFrame.
+    """Load and concatenate all ``lineups_*.parquet`` files into one DataFrame.
 
     Args:
-        raw_dir (str): Répertoire contenant les fichiers ``lineups_*.parquet``.
+        raw_dir: Directory containing the parquet files.
 
     Returns:
-        pd.DataFrame: DataFrame consolidé de tous les lineups. Vide si aucun
-        fichier n'est trouvé.
+        Combined DataFrame, or empty DataFrame if no file is found.
     """
     pattern = os.path.join(raw_dir, 'lineups_*.parquet')
     files = sorted(glob.glob(pattern))
 
     if not files:
-        print(f'[WARN] Aucun fichier lineups trouvé dans {raw_dir}')
+        print(f'[WARN] No lineups file found in {raw_dir}')
         return pd.DataFrame()
 
     frames = []
@@ -181,12 +181,12 @@ def load_raw_lineups(raw_dir=DATA_RAW):
         try:
             frames.append(pd.read_parquet(path))
         except Exception:
-            print(f'[ERROR] Lecture {path}:')
+            print(f'[ERROR] Reading {path}:')
             traceback.print_exc()
 
     if not frames:
         return pd.DataFrame()
 
     df = pd.concat(frames, ignore_index=True)
-    print(f'[LOAD] {len(files)} fichier(s) lineups — {len(df)} lignes au total.')
+    print(f'[LOAD] {len(files)} lineups file(s) — {len(df)} rows total.')
     return df

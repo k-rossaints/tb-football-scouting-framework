@@ -2,16 +2,23 @@
 # TACTICAL ROLE PROFILES
 # tb-football-scouting-framework
 # ============================================================
-# Each role is a weighted combination of player metrics.
-# Weights reflect the tactical importance of each metric for that role.
-# Higher weight = more important for this role.
+# Each role is a weighted combination of player metrics. Weights reflect
+# the tactical importance of each metric for that role.
 #
-# Weights are justified by:
-# - Football Manager 2026 key/important attribute taxonomy
-#   (Sports Interactive, 2026 — developed with professional scouts)
+# Naming convention: this file uses the ``_per90`` suffix; the parquet
+# uses ``_p90``. The matching layer (src/matching.py) translates between
+# the two automatically and drops metrics that are not available.
+#
+# Player examples are deliberately drawn from the empirical 2015/16 top
+# of each role in this dataset — they are observations, not assumptions.
+# They are not cited as universal archetypes (players evolve over time;
+# a 2015/16 striker may not look like his 2020/21 self).
+#
+# Sources for the role taxonomy:
+# - Football Manager role catalogue (Sports Interactive)
 # - Academic literature on role-based player profiling
-#   (Aalbers & Van Haaren, 2019; Wicki, 2023)
-# - Domain knowledge of elite football tactical systems
+#   (Aalbers & Van Haaren 2019; Wicki 2023)
+# - Domain knowledge of modern tactical systems
 # ============================================================
 
 # ─────────────────────────────────────────────────────────────
@@ -20,9 +27,10 @@
 CB:
 
   ball_playing_defender:
-    # Inspired by FM2026 "Ball-Playing Defender" role
-    # Key FM attributes: Passing, First Touch, Composure, Technique
-    # Real examples profile: Piqué, Van Dijk, Barella-style CBs
+    # FM equivalent: Ball-Playing Defender
+    # Signature: composed under pressure, distributes through and out of
+    # the back line, contributes to build-up rather than just clearing.
+    # 2015/16 empirical top: Mascherano, Bartra, Thiago Silva, Kimmich, Piqué
     progressive_passes_per90: 3.0
     pass_completion_rate: 2.5
     pass_completion_under_pressure: 2.5
@@ -36,26 +44,29 @@ CB:
     aerial_duel_win_rate: 0.5
 
   no_nonsense_cb:
-    # Inspired by FM2026 "No-Nonsense Centre-Back" role
-    # Key FM attributes: Tackling, Marking, Heading, Bravery
-    # REVISED 2025-05 : on alourdit les taux (discriminants) plutôt que les
-    # volumes (redondants entre eux et fortement corrélés). On retire aussi
-    # 'defensive_actions_per90' qui est colinéaire avec tackles+interceptions+
-    # clearances et écrasait le spread.
-    aerial_duel_win_rate: 4.0      # signature absolue du no-nonsense
-    aerial_duels_per90: 3.0        # volume de duels aériens disputés
-    ground_duel_win_rate: 3.0      # efficacité au sol
+    # FM equivalent: No-Nonsense Centre-Back
+    # Signature: physical duellist who clears danger and wins the air —
+    # not asked to play out from the back.
+    # REVISED 2026-05: weight the *rates* (discriminative) over volumes
+    # (redundant and highly inter-correlated). The colinear
+    # ``defensive_actions_per90`` (= tackles + interceptions + clearances)
+    # was removed because it was flattening the spread.
+    aerial_duel_win_rate: 4.0      # heading signature
+    aerial_duels_per90: 3.0        # aerial volume engaged
+    ground_duel_win_rate: 3.0      # ground efficiency
     clearances_per90: 3.0
     blocks_per90: 2.5
     interceptions_per90: 2.0
     tackles_per90: 1.5
     recoveries_per90: 1.5
-    pass_completion_rate: 0.5      # un no-nonsense n'est pas un passeur
-    progressive_passes_per90: 0.0  # explicitement neutre
+    pass_completion_rate: 0.5      # not asked to be a distributor
+    progressive_passes_per90: 0.0  # explicitly neutral
 
   aerial_dominant_cb:
-    # Inspired by FM2026 "Central Defender (Stopper)" role
-    # Key FM attributes: Heading, Jumping Reach, Strength, Aerial Ability
+    # FM-adjacent: a stopper-style CB whose primary value is winning the
+    # aerial duel — both volume contested and win rate. Sits between the
+    # FM "Stopper" duty (steps out to engage) and a classical target-
+    # winning defender.
     aerial_duels_per90: 4.0
     aerial_duel_win_rate: 4.0
     clearances_per90: 3.0
@@ -70,18 +81,20 @@ CB:
 FB:
 
   complete_wing_back:
-    # Inspired by FM2026 "Complete Wing-Back" role
-    # Key FM attributes: Crossing, Dribbling, Stamina, Off The Ball
-    # REVISED 2025-05 : on alourdit la création (xA, key_passes) pour
-    # distinguer les VRAIS complete-WB (qui assistent) des simples centreurs
-    # volumineux. Ajout de carries_into_penalty_area (Cancelo-tendance) et
-    # baisse des métriques défensives qui ne sont pas la signature de ce rôle.
-    xA_per90: 3.5                          # création réelle
-    key_passes_per90: 3.0                  # création réelle
+    # FM equivalent: Complete Wing-Back
+    # Signature: high-volume crosser AND creator from wide. Carries the
+    # ball forward and provides genuine assists, not just whipped balls.
+    # 2015/16 empirical top: Alex Sandro, Cuadrado, Marcelo, Maicon
+    # REVISED 2026-05: weight creation (xA, key_passes) over raw crossing
+    # to distinguish actual creators from high-volume but low-impact
+    # crossers. Added carries_into_penalty_area for modern attacking-FB
+    # signatures.
+    xA_per90: 3.5                          # real chance creation
+    key_passes_per90: 3.0                  # real chance creation
     crosses_per90: 2.5
     passes_into_penalty_area_per90: 2.5
     progressive_carries_per90: 2.5
-    carries_into_penalty_area_per90: 2.0   # NOUVEAU
+    carries_into_penalty_area_per90: 2.0
     carries_into_final_third_per90: 2.0
     dribbles_success_rate: 2.0
     pressures_per90: 1.0
@@ -89,8 +102,9 @@ FB:
     interceptions_per90: 0.5
 
   inverted_wing_back:
-    # Inspired by FM2026 "Inverted Wing-Back" role (Cancelo-style)
-    # Key FM attributes: Passing, Vision, Technique, Decisions
+    # FM equivalent: Inverted Wing-Back
+    # Signature: drifts inside in possession to behave like a deep
+    # midfielder — circulates and progresses through the centre.
     progressive_passes_per90: 3.0
     pass_completion_rate: 2.5
     passes_into_final_third_per90: 2.5
@@ -102,18 +116,19 @@ FB:
     interceptions_per90: 1.0
 
   defensive_full_back:
-    # Inspired by FM2026 "Full-Back (Defend)" role
-    # Key FM attributes: Marking, Tackling, Positioning, Concentration
-    # REVISED 2025-05 : suppression de defensive_actions_per90 (colinéaire
-    # avec tackles+interceptions+clearances). Ajout du pressing (dimension
-    # discriminante chez les FB défensifs modernes) et alourdissement des
-    # taux de duels (efficacité plutôt que volume).
+    # FM equivalent: Full-Back (Defend)
+    # Signature: prioritises positioning, tackling and duel efficiency
+    # over forward contribution.
+    # 2015/16 empirical top: Filipe Luís, Debuchy, Aurier
+    # REVISED 2026-05: removed colinear ``defensive_actions_per90``,
+    # added a modest pressing weight (a feature of modern defensive FBs
+    # under high-block schemes), and weighted duel *rates* over volumes.
     tackles_per90: 4.0
     interceptions_per90: 3.5
-    ground_duel_win_rate: 3.0      # efficacité
-    aerial_duel_win_rate: 3.0      # efficacité
+    ground_duel_win_rate: 3.0      # efficiency
+    aerial_duel_win_rate: 3.0      # efficiency
     recoveries_per90: 2.5
-    pressures_per90: 1.5           # NOUVEAU (FB moderne)
+    pressures_per90: 1.5           # modern FB pressing duty
     clearances_per90: 1.5
     pass_completion_rate: 1.0
 
@@ -123,9 +138,10 @@ FB:
 MF:
 
   deep_lying_playmaker:
-    # Inspired by FM2026 "Deep-Lying Playmaker" role
-    # Key FM attributes: Passing, Vision, Composure, Technique
-    # Real examples profile: Busquets, Pirlo, Kroos
+    # FM equivalent: Deep-Lying Playmaker
+    # Signature: sets the team's tempo from a deep position, completes
+    # passes under pressure, switches play and breaks lines.
+    # 2015/16 empirical top: Kroos, Vidal, Thiago Alcântara, Modrić, Xabi Alonso
     progressive_passes_per90: 3.5
     pass_completion_rate: 3.0
     passes_attempted_per90: 2.5
@@ -138,9 +154,9 @@ MF:
     tackles_per90: 0.5
 
   ball_winning_midfielder:
-    # Inspired by FM2026 "Ball-Winning Midfielder" role
-    # Key FM attributes: Tackling, Work Rate, Stamina, Aggression
-    # Real examples profile: Kante, Rodri (defensive side)
+    # FM equivalent: Ball-Winning Midfielder
+    # Signature: high-volume defensive midfielder — tackles, intercepts,
+    # presses, recovers, with limited but reliable on-ball output.
     tackles_per90: 4.0
     interceptions_per90: 3.5
     pressures_per90: 3.0
@@ -152,17 +168,17 @@ MF:
     progressive_passes_per90: 0.5
 
   box_to_box_midfielder:
-    # Inspired by FM2026 "Box-to-Box Midfielder" role
-    # Key FM attributes: Stamina, Work Rate, Passing, Shooting
-    # REVISED 2025-05 : l'ancienne pondération uniforme (toutes les métriques
-    # autour de 2.0) produisait des "moyens partout" en tête (top1=77, spread=4).
-    # La signature B2B = porter le ballon vers l'avant ET finir, plus que
-    # défendre (ce qui distingue du BWM). On alourdit donc carries+shots et
-    # on baisse les actions défensives à un niveau "présence" plutôt que
-    # "dominance".
-    progressive_carries_per90: 3.5         # signature B2B : transition
+    # FM equivalent: Box-to-Box Midfielder
+    # Signature: covers ground vertically — carries the ball forward,
+    # arrives in the box to shoot, while still contributing defensively.
+    # REVISED 2026-05: previous version had uniform ~2.0 weights and
+    # rewarded "average everywhere" profiles (top1 ~77, spread ~4). New
+    # weighting emphasises carries + finishing (the transition signature
+    # that distinguishes B2B from BWM), with defending demoted to a
+    # baseline rather than a primary requirement.
+    progressive_carries_per90: 3.5
     carries_into_final_third_per90: 3.0
-    shots_per90: 3.0                       # arrive dans la surface
+    shots_per90: 3.0
     xG_per90: 2.5
     pressures_per90: 2.5
     key_passes_per90: 2.0
@@ -172,8 +188,10 @@ MF:
     xA_per90: 1.0
 
   mezzala:
-    # Inspired by FM2026 "Mezzala" role
-    # Key FM attributes: Dribbling, Passing, Off The Ball, Vision
+    # FM equivalent: Mezzala
+    # Signature: half-space operator who carries into the final third,
+    # combines creation with arriving runs and shooting threat.
+    # 2015/16 empirical top: Cazorla, Thiago Alcântara, Hamšík
     progressive_carries_per90: 3.0
     carries_into_final_third_per90: 3.0
     dribbles_success_rate: 2.5
@@ -190,8 +208,10 @@ MF:
 AM:
 
   advanced_playmaker:
-    # Inspired by FM2026 "Advanced Playmaker" role
-    # Key FM attributes: Vision, Passing, Technique, First Touch
+    # FM equivalent: Advanced Playmaker
+    # Signature: primary creator in the final third — vision, key passes,
+    # final-third entries, high touch volume in dangerous zones.
+    # 2015/16 empirical top: Messi, Valbuena, Özil, Di María, David Silva
     key_passes_per90: 4.0
     xA_per90: 4.0
     progressive_passes_per90: 3.0
@@ -202,8 +222,10 @@ AM:
     shots_per90: 1.0
 
   inside_forward:
-    # Inspired by FM2026 "Inside Forward" role (Salah/Robben style)
-    # Key FM attributes: Dribbling, Finishing, Off The Ball, Acceleration
+    # FM equivalent: Inside Forward
+    # Signature: wide forward who cuts inside to shoot, carries into the
+    # box, finishes — but also contributes some creation.
+    # 2015/16 empirical top: Messi, Neymar, Alexis Sánchez
     shots_per90: 3.5
     xG_per90: 3.5
     dribbles_success_rate: 3.0
@@ -214,8 +236,9 @@ AM:
     key_passes_per90: 1.5
 
   pressing_winger:
-    # Inspired by FM2026 "Winger (Support)" with high pressing duty
-    # Key FM attributes: Work Rate, Pace, Dribbling, Pressing
+    # FM-adjacent: Winger with a high pressing duty.
+    # Signature: wide attacker whose first job out of possession is to
+    # press and win the ball back high up the pitch.
     pressures_per90: 3.5
     pressure_success_rate: 3.0
     dribbles_success_rate: 2.5
@@ -231,8 +254,10 @@ AM:
 ST:
 
   advanced_forward:
-    # Inspired by FM2026 "Advanced Forward" role
-    # Key FM attributes: Finishing, Off The Ball, Pace, Dribbling
+    # FM equivalent: Advanced Forward
+    # Signature: complete attacking forward — high shot volume and xG,
+    # works in the box, runs in behind, contributes some carries.
+    # 2015/16 empirical top: Aubameyang, Ibrahimović, Benzema, Agüero, Lewandowski
     xG_per90: 4.0
     shots_per90: 3.5
     shots_on_target_per90: 3.0
@@ -243,9 +268,11 @@ ST:
     xA_per90: 1.0
 
   pressing_forward:
-    # Inspired by FM2026 "Pressing Forward" role
-    # Key FM attributes: Work Rate, Pressing, Stamina, Aggression
-    # Real examples profile: Firmino, Benzema (pressing side)
+    # FM equivalent: Pressing Forward
+    # Signature: defends from the front — leads the press, recovers
+    # balls high, draws fouls; finishing is secondary to the defensive
+    # workload.
+    # 2015/16 empirical top: Ángel Correa, Ulloa
     pressures_per90: 4.5
     pressure_success_rate: 4.0
     recoveries_per90: 3.0
@@ -256,8 +283,10 @@ ST:
     carries_per90: 1.5
 
   poacher:
-    # Inspired by FM2026 "Poacher" role
-    # Key FM attributes: Finishing, Off The Ball, Composure, Anticipation
+    # FM equivalent: Poacher
+    # Signature: pure box-occupant — high xG per shot, lots of touches
+    # in the box, finishes first-time chances. Minimal defensive duty.
+    # 2015/16 empirical top: Aubameyang, Suárez, Lewandowski, Benzema, Gameiro
     xG_per_shot: 4.0
     shots_on_target_per90: 3.5
     shots_first_touch_per90: 3.0
@@ -267,8 +296,10 @@ ST:
     pressures_per90: 0.5
 
   deep_lying_forward:
-    # Inspired by FM2026 "Deep-Lying Forward" role
-    # Key FM attributes: Passing, Vision, First Touch, Work Rate
+    # FM equivalent: Deep-Lying Forward
+    # Signature: drops into midfield to link play — creates more than he
+    # finishes, carries the ball, combines with onrushing midfielders.
+    # 2015/16 empirical top: Dybala, Iheanacho
     key_passes_per90: 3.5
     xA_per90: 3.5
     progressive_passes_per90: 2.5

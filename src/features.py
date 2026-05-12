@@ -1,15 +1,15 @@
 """
-features.py — Construction des features joueurs à partir des events StatsBomb bruts.
+features.py — Build per-player feature matrix from raw StatsBomb events.
 
-Pipeline :
-    1. Charge les events parquet bruts (data/raw/events_*.parquet).
-    2. Extrait les coordonnées (start/end) des locations.
-    3. Calcule les minutes jouées par (match, joueur).
-    4. Agrège ~40 métriques par joueur sur la saison, normalisées per 90 min.
-    5. Filtre les joueurs avec moins de 450 minutes totales.
-    6. Sauvegarde dans data/processed/player_features.parquet.
+Pipeline:
+    1. Load raw event parquets (data/raw/events_*.parquet).
+    2. Extract (x, y) coordinates from StatsBomb location arrays.
+    3. Compute minutes played per (match, player).
+    4. Aggregate ~40 metrics per player over the season, normalised per 90 min.
+    5. Filter players with fewer than 450 minutes total.
+    6. Save to data/processed/player_features.parquet.
 
-Pas de boucle sur les lignes : tout est vectorisé via groupby/merge_asof.
+No row-level loops: everything is vectorised through groupby / merge_asof.
 """
 
 import os
@@ -25,7 +25,7 @@ DATA_PROCESSED = PROJECT_ROOT / 'data' / 'processed'
 
 
 # ---------------------------------------------------------------------------
-# Constantes
+# Constants
 # ---------------------------------------------------------------------------
 
 POSITION_MAP = {
@@ -46,57 +46,57 @@ POSITION_MAP = {
     'Secondary Striker': 'ST',
 }
 
-MIN_MINUTES = 450        # seuil de filtrage
-PITCH_X = 120.0          # longueur terrain StatsBomb
-PITCH_Y = 80.0           # largeur terrain StatsBomb
-FINAL_THIRD_X = 80.0     # x >= 80 => tiers offensif
-BOX_X_MIN = 102.0        # surface adverse
+MIN_MINUTES = 450        # minimum season minutes for inclusion
+PITCH_X = 120.0          # StatsBomb pitch length
+PITCH_Y = 80.0           # StatsBomb pitch width
+FINAL_THIRD_X = 80.0     # x >= 80 means attacking third
+BOX_X_MIN = 102.0        # opponent penalty area
 BOX_Y_MIN, BOX_Y_MAX = 18.0, 62.0
-PROG_PASS_DELTA = 10.0   # delta_x mini pour passe progressive
-PROG_CARRY_DELTA = 5.0   # delta_x mini pour conduite progressive
-LONG_PASS_LEN = 35.0     # passe longue
-PRESSURE_WINDOW = 5.0    # fenêtre de succès de pressing (secondes)
+PROG_PASS_DELTA = 10.0   # min delta_x to qualify as a progressive pass
+PROG_CARRY_DELTA = 5.0   # min delta_x to qualify as a progressive carry
+LONG_PASS_LEN = 35.0     # long-pass threshold (yards)
+PRESSURE_WINDOW = 5.0    # seconds — pressing-success time window
 
+# Event types that signal possession won / kept by the pressing team
 POSSESSION_RECOVERY_TYPES = {
     'Ball Recovery', 'Interception', 'Pass', 'Carry', 'Shot', 'Clearance',
 }
 
 
 # ---------------------------------------------------------------------------
-# Chargement
+# Loading
 # ---------------------------------------------------------------------------
 
 def _load_concat(raw_dir, prefix):
-    """Charge et concatène tous les parquet ``{prefix}_*.parquet`` de raw_dir."""
+    """Load and concatenate every ``{prefix}_*.parquet`` file in raw_dir."""
     files = sorted(glob.glob(os.path.join(raw_dir, f'{prefix}_*.parquet')))
     if not files:
-        raise FileNotFoundError(f'Aucun fichier {prefix}_*.parquet dans {raw_dir}')
+        raise FileNotFoundError(f'No {prefix}_*.parquet file in {raw_dir}')
     frames = [pd.read_parquet(p) for p in files]
-    df = pd.concat(frames, ignore_index=True)
-    return df
+    return pd.concat(frames, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
-# Helpers vectorisés
+# Vectorised helpers
 # ---------------------------------------------------------------------------
 
 def _extract_xy(series):
-    """Extrait les coordonnées (x, y) d'une colonne de locations StatsBomb.
+    """Extract (x, y) arrays from a StatsBomb location column.
 
-    StatsBomb stocke chaque location comme une liste/ndarray ``[x, y]`` (ou
-    ``[x, y, z]`` pour certains tirs). Les valeurs manquantes deviennent NaN.
+    StatsBomb stores each location as a list/ndarray ``[x, y]`` (or
+    ``[x, y, z]`` for some shots). Missing values become NaN.
 
     Args:
-        series (pd.Series): colonne contenant des arrays/listes/None.
+        series: Column holding arrays / lists / None.
 
     Returns:
-        tuple[np.ndarray, np.ndarray]: deux arrays float (x, y).
+        Tuple of two float arrays (x, y) of the same length as ``series``.
     """
     mask = series.notna().to_numpy()
     x = np.full(len(series), np.nan, dtype='float64')
     y = np.full(len(series), np.nan, dtype='float64')
     if mask.any():
-        # vstack supporte arrays et listes hétérogènes en tronquant à 2 colonnes
+        # Truncate to first two coords to handle [x, y, z] shot locations.
         vals = np.array(
             [np.asarray(v, dtype='float64')[:2] for v in series[mask]],
             dtype='float64',
@@ -107,21 +107,22 @@ def _extract_xy(series):
 
 
 def _prepare_events(events):
-    """Enrichit le DataFrame d'events avec des colonnes dérivées.
+    """Enrich an events DataFrame with derived columns.
 
-    Ajoute : ``t_sec`` (timestamp absolu en secondes depuis le coup d'envoi),
-    ``start_x/start_y``, ``pass_end_x/pass_end_y``, ``carry_end_x/carry_end_y``,
-    et harmonise les booléens (``under_pressure``, ``counterpress``).
+    Adds: ``t_sec`` (continuous seconds since kick-off), ``start_x/start_y``,
+    ``pass_end_x/pass_end_y``, ``carry_end_x/carry_end_y``, and coerces
+    sparse boolean flags (``under_pressure``, ``counterpress``, ...) to
+    proper bools so they can be used in vectorised masks.
 
     Args:
-        events (pd.DataFrame): events bruts concaténés.
+        events: Raw, concatenated event DataFrame.
 
     Returns:
-        pd.DataFrame: copie enrichie, triée par (match_id, period, t_sec).
+        Enriched copy, sorted by ``(match_id, period, t_sec)``.
     """
     df = events.copy()
 
-    # Timestamp continu en secondes (deux mi-temps : on additionne le temps écoulé)
+    # Continuous timestamp in seconds (per half — merge_asof groups by period)
     df['t_sec'] = df['minute'].astype('float64') * 60.0 + df['second'].astype('float64')
 
     # Locations
@@ -134,7 +135,7 @@ def _prepare_events(events):
     cex, cey = _extract_xy(df['carry_end_location'])
     df['carry_end_x'], df['carry_end_y'] = cex, cey
 
-    # Booléens : None -> False
+    # Coerce sparse booleans (None / NaN -> False)
     for col in ('under_pressure', 'counterpress',
                 'pass_shot_assist', 'pass_goal_assist',
                 'pass_aerial_won', 'clearance_aerial_won',
@@ -144,27 +145,26 @@ def _prepare_events(events):
             df[col] = df[col].fillna(False).astype(bool)
 
     df = df.sort_values(['match_id', 'period', 't_sec'], kind='stable')
-    df = df.reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Minutes jouées
+# Minutes played
 # ---------------------------------------------------------------------------
 
 def compute_minutes(events):
-    """Calcule les minutes jouées par (match_id, player_id).
+    """Compute minutes played per ``(match_id, player_id)``.
 
-    Définition : différence entre le timestamp du premier et du dernier
-    événement du joueur dans le match. Approximation acceptable pour des
-    titulaires ; les remplaçants sont sous-estimés sur leur fenêtre exacte
-    mais le filtrage à 450 min lisse l'effet.
+    Definition: difference between the player's first and last event in the
+    match. This is exact for starters; substitutes are slightly under-
+    estimated on the edges of their window, but the 450-minute season
+    filter smooths the effect.
 
     Args:
-        events (pd.DataFrame): events enrichis (doit contenir ``t_sec``).
+        events: Enriched events (must contain ``t_sec``).
 
     Returns:
-        pd.DataFrame: colonnes ``match_id, player_id, minutes_match``.
+        DataFrame with columns ``match_id, player_id, minutes_match``.
     """
     df = events.dropna(subset=['player_id']).copy()
     grp = df.groupby(['match_id', 'player_id'], observed=True)['t_sec']
@@ -174,75 +174,23 @@ def compute_minutes(events):
 
 
 # ---------------------------------------------------------------------------
-# Pressing : pression suivie d'une récupération dans les 5 s
+# Pressing success: a Pressure followed by same-team recovery within 5 s
 # ---------------------------------------------------------------------------
 
 def _flag_pressure_success(events):
-    """Marque chaque ``Pressure`` comme réussie si la même équipe touche le
-    ballon dans les ``PRESSURE_WINDOW`` secondes suivantes.
+    """Flag each ``Pressure`` as successful when the pressing team touches the
+    ball within :data:`PRESSURE_WINDOW` seconds.
 
-    Implémentation vectorisée via ``merge_asof`` : pour chaque pressure on
-    cherche le prochain événement de récupération/possession de la même équipe
-    et même mi-temps dans la fenêtre temporelle.
-
-    Args:
-        events (pd.DataFrame): events enrichis.
-
-    Returns:
-        pd.Series: index aligné sur events, True ssi pressure réussie.
-    """
-    is_press = events['type'].eq('Pressure')
-    success = pd.Series(False, index=events.index)
-
-    # Candidats récupération (même équipe, après la pressure)
-    recov_mask = events['type'].isin(POSSESSION_RECOVERY_TYPES)
-    recov = (
-        events.loc[recov_mask, ['match_id', 'period', 'team', 't_sec']]
-              .sort_values(['team', 'match_id', 'period', 't_sec'])
-              .reset_index(drop=True)
-    )
-
-    press = (
-        events.loc[is_press, ['match_id', 'period', 'team', 't_sec']]
-              .sort_values(['team', 'match_id', 'period', 't_sec'])
-    )
-    press_idx = press.index
-    press = press.reset_index(drop=True)
-
-    merged = pd.merge_asof(
-        press,
-        recov,
-        by=['team', 'match_id', 'period'],
-        on='t_sec',
-        direction='forward',
-        allow_exact_matches=False,
-        tolerance=PRESSURE_WINDOW,
-        suffixes=('', '_r'),
-    )
-
-    # On rebascule sur l'index original via press_idx (ordre conservé)
-    won = merged['t_sec'].notna() & (merged['t_sec'] - press['t_sec'] <= PRESSURE_WINDOW)
-    # Note : merge_asof remplace t_sec côté droit dans 't_sec_r' uniquement si suffixes diff.
-    # Ici on a juste besoin que le match ait été trouvé => merged contient une ligne par press,
-    # avec NaN si aucun candidat. On utilise donc merged['team'] non-null comme proxy : il l'est
-    # toujours côté gauche. On se rabat sur la présence d'un match via une colonne récupérée à droite.
-    # On utilise plutôt l'index du candidat trouvé : merge_asof n'expose pas l'index, on déduit du
-    # nombre de colonnes ajoutées. Approche simple et fiable : on duplique une colonne marqueur.
-    success.loc[press_idx] = won.to_numpy()
-    return success
-
-
-def _flag_pressure_success_v2(events):
-    """Variante robuste de :func:`_flag_pressure_success` utilisant un marqueur.
-
-    On ajoute une colonne ``_rid`` côté récupérations puis on vérifie sa
-    présence après ``merge_asof``. Plus lisible que la version précédente.
+    Vectorised through ``merge_asof``: for every Pressure event we search
+    forward for the next recovery/possession event of the same team in the
+    same half within the time tolerance. A sentinel column (``_rid``) on
+    the right side lets us detect whether a match was found.
 
     Args:
-        events (pd.DataFrame): events enrichis.
+        events: Enriched events.
 
     Returns:
-        pd.Series: index aligné sur events, True ssi pressure réussie.
+        Boolean Series aligned on the events index — True iff successful.
     """
     is_press = events['type'].eq('Pressure')
     success = pd.Series(False, index=events.index)
@@ -273,21 +221,21 @@ def _flag_pressure_success_v2(events):
 
 
 # ---------------------------------------------------------------------------
-# xA : somme des xG des tirs assistés par les passes du joueur
+# xA: link each pass to the xG of the shot it created
 # ---------------------------------------------------------------------------
 
 def _compute_xa_per_pass(events):
-    """Associe à chaque passe son xA = xG du tir résultant (si existe).
+    """Attach to each pass the xG of the resulting shot (its xA value).
 
-    Une passe est assist potentiel ssi ``pass_assisted_shot_id`` est rempli.
-    On joint cet id avec ``id`` du tir correspondant pour récupérer son xG.
+    A pass is a potential assist iff ``pass_assisted_shot_id`` is set; this
+    id is joined onto the shot's ``id`` to retrieve the shot's xG.
 
     Args:
-        events (pd.DataFrame): events enrichis.
+        events: Enriched events.
 
     Returns:
-        pd.Series: xA par ligne (0 sauf sur les passes assistantes), aligné
-        sur l'index de ``events``.
+        Series of xA values (0 for non-assist passes), aligned on the
+        events index.
     """
     shots = events.loc[events['type'].eq('Shot'), ['id', 'shot_statsbomb_xg']].rename(
         columns={'id': 'pass_assisted_shot_id', 'shot_statsbomb_xg': '_xa'}
@@ -295,45 +243,43 @@ def _compute_xa_per_pass(events):
     xa = events[['pass_assisted_shot_id']].merge(
         shots, on='pass_assisted_shot_id', how='left'
     )['_xa']
-    xa = xa.fillna(0.0).to_numpy()
-    return pd.Series(xa, index=events.index)
+    return pd.Series(xa.fillna(0.0).to_numpy(), index=events.index)
 
 
 # ---------------------------------------------------------------------------
-# Position dominante par joueur
+# Dominant position per player
 # ---------------------------------------------------------------------------
 
 def _dominant_position(events):
-    """Détermine la position (groupée) la plus fréquente pour chaque joueur.
+    """Pick each player's most-frequent (grouped) position over the season.
 
-    On compte les events par (player_id, position StatsBomb), on mappe via
-    :data:`POSITION_MAP`, puis on retient le groupe dominant. Les joueurs sans
-    position mappable (gardiens, remplaçants jamais entrés) reçoivent NaN.
+    Counts events by ``(player_id, StatsBomb position)``, maps through
+    :data:`POSITION_MAP`, then keeps the dominant group. Players with no
+    mappable position (goalkeepers, unused substitutes) get NaN.
 
     Args:
-        events (pd.DataFrame): events enrichis.
+        events: Enriched events.
 
     Returns:
-        pd.DataFrame: colonnes ``player_id, position_group, position_raw``.
+        DataFrame with columns ``player_id, position_group, position_raw``.
     """
     df = events.dropna(subset=['player_id', 'position']).copy()
     df['position_group'] = df['position'].map(POSITION_MAP)
 
     counts = (
         df.groupby(['player_id', 'position_group', 'position'], observed=True)
-          .size()
-          .rename('n')
-          .reset_index()
+          .size().rename('n').reset_index()
     )
-    # Position brute la plus fréquente par joueur (pour info)
+    # Most frequent raw position (informational)
     raw_top = (
         counts.sort_values(['player_id', 'n'], ascending=[True, False])
               .drop_duplicates('player_id')
               [['player_id', 'position']]
               .rename(columns={'position': 'position_raw'})
     )
-    # Groupe le plus fréquent
-    group_counts = counts.groupby(['player_id', 'position_group'], observed=True)['n'].sum().reset_index()
+    # Most frequent grouped position
+    group_counts = counts.groupby(['player_id', 'position_group'],
+                                  observed=True)['n'].sum().reset_index()
     group_top = (
         group_counts.sort_values(['player_id', 'n'], ascending=[True, False])
                     .drop_duplicates('player_id')
@@ -343,23 +289,23 @@ def _dominant_position(events):
 
 
 # ---------------------------------------------------------------------------
-# Agrégation des features par joueur
+# Per-player feature aggregation
 # ---------------------------------------------------------------------------
 
 def _aggregate_player_counts(events):
-    """Compte les actions de chaque joueur sur la saison.
+    """Sum every action indicator per player over the season.
 
-    Construit un DataFrame avec une ligne par joueur et toutes les sommes
-    nécessaires (passes, tirs, duels, etc.). Toutes les colonnes sont des
-    indicateurs booléens/entiers calculés en amont puis sommés par groupby.
+    Builds boolean / integer indicators for each event of interest, then
+    sums them per ``player_id``. All metrics are computed vectorially —
+    no per-row iteration.
 
     Args:
-        events (pd.DataFrame): events enrichis (sortie de :func:`_prepare_events`).
+        events: Enriched events (output of :func:`_prepare_events`).
 
     Returns:
-        pd.DataFrame: indexé par ``player_id`` avec des colonnes brutes.
+        DataFrame indexed by ``player_id`` with raw count columns.
     """
-    e = events  # alias
+    e = events  # short alias
     is_pass    = e['type'].eq('Pass')
     is_shot    = e['type'].eq('Shot')
     is_carry   = e['type'].eq('Carry')
@@ -369,7 +315,7 @@ def _aggregate_player_counts(events):
 
     pass_completed = is_pass & e['pass_outcome'].isna()
 
-    # --- Passes
+    # --- Passing
     start_x = e['start_x']
     end_x   = e['pass_end_x']
     long_pass = is_pass & (e['pass_length'] >= LONG_PASS_LEN)
@@ -382,19 +328,20 @@ def _aggregate_player_counts(events):
 
     xa = _compute_xa_per_pass(e)
 
-    # --- Défense
+    # --- Defending
     is_clearance     = e['type'].eq('Clearance')
     is_block         = e['type'].eq('Block')
     is_interception  = e['type'].eq('Interception')
     is_recovery      = e['type'].eq('Ball Recovery')
 
-    # Tacles = duels de type 'Tackle' gagnés
+    # Tackles = Tackle-type duels with a winning outcome
     tackle_attempt = is_duel & e['duel_type'].eq('Tackle')
     tackle_won = tackle_attempt & e['duel_outcome'].isin(
         ['Won', 'Success In Play', 'Success Out']
     )
 
-    # Duels aériens : perdus = Duel/Aerial Lost ; gagnés = flags *_aerial_won
+    # Aerial duels: losses come as Duel/Aerial Lost; wins are flagged on the
+    # subsequent event via *_aerial_won booleans.
     aerial_lost = is_duel & e['duel_type'].eq('Aerial Lost')
     aerial_won = (
         e['pass_aerial_won'] | e['clearance_aerial_won']
@@ -402,10 +349,10 @@ def _aggregate_player_counts(events):
     )
     aerial_total = aerial_lost | aerial_won
 
-    # Duels au sol : tacles attempts + 'Dribbled Past' (côté défenseur)
+    # Ground duels: tackle attempts + Dribbled Past (defender side)
     is_dribbled_past = e['type'].eq('Dribbled Past')
     ground_total = tackle_attempt | is_dribbled_past
-    ground_won = tackle_won  # gagner un duel au sol = remporter le tacle
+    ground_won = tackle_won  # winning a ground duel == winning the tackle
 
     # --- Carries
     cdx = e['carry_end_x'] - start_x
@@ -415,9 +362,9 @@ def _aggregate_player_counts(events):
     f3_carry = is_carry & (e['carry_end_x'] >= FINAL_THIRD_X) & (start_x < FINAL_THIRD_X)
 
     # --- Pressing
-    pressure_success = _flag_pressure_success_v2(e) & is_press
+    pressure_success = _flag_pressure_success(e) & is_press
 
-    # --- Offensif
+    # --- Attacking
     shot_on_target_outcomes = {'Saved', 'Goal', 'Saved to Post', 'Saved Off Target'}
     shot_on_target = is_shot & e['shot_outcome'].isin(shot_on_target_outcomes)
     xg = np.where(is_shot, e['shot_statsbomb_xg'].fillna(0.0), 0.0)
@@ -430,8 +377,8 @@ def _aggregate_player_counts(events):
 
     dribble_complete = is_dribble & e['dribble_outcome'].eq('Complete')
 
-    # --- Métriques additionnelles (centres, passes/carries dans la surface,
-    # switches, tirs en première intention, actions défensives)
+    # --- Extra metrics (crosses, box entries, switches, first-time shots,
+    # total defensive actions)
     crosses = is_pass & e['pass_cross']
     switches = is_pass & e['pass_switch']
 
@@ -440,6 +387,7 @@ def _aggregate_player_counts(events):
         & (e['pass_end_y'] >= BOX_Y_MIN)
         & (e['pass_end_y'] <= BOX_Y_MAX)
     )
+    # Entries only: start outside the box, end inside
     passes_into_box = pass_completed & in_box_pass_end & (e['start_x'] < BOX_X_MIN)
 
     in_box_carry_end = (
@@ -451,20 +399,20 @@ def _aggregate_player_counts(events):
 
     shots_first_touch = is_shot & e['shot_first_time']
 
-    # defensive_actions = tackles (won) + interceptions + clearances
+    # defensive_actions = won tackles ∨ interceptions ∨ clearances
     defensive_actions = tackle_won | is_interception | is_clearance
 
-    # --- Général
+    # --- General
     is_foul_committed = e['type'].eq('Foul Committed')
     is_foul_won       = e['type'].eq('Foul Won')
     is_dispossessed   = e['type'].eq('Dispossessed')
     is_miscontrol     = e['type'].eq('Miscontrol')
-    # Touche = tout event positionné par le joueur (proxy)
+    # Touch = any positioned event by the player (proxy for ball touches)
     is_touch = e['player_id'].notna() & e['start_x'].notna()
 
     work = pd.DataFrame({
         'player_id': e['player_id'],
-        # passes
+        # passing
         'passes_attempted':       is_pass.astype('int32'),
         'passes_completed':       pass_completed.astype('int32'),
         'progressive_passes':     prog_pass.astype('int32'),
@@ -475,7 +423,7 @@ def _aggregate_player_counts(events):
         'passes_under_pressure':  pass_under_press.astype('int32'),
         'passes_completed_under_pressure': pass_comp_under_press.astype('int32'),
         'xA':                     xa.astype('float64'),
-        # défense
+        # defending
         'tackles':                tackle_won.astype('int32'),
         'interceptions':          is_interception.astype('int32'),
         'clearances':             is_clearance.astype('int32'),
@@ -493,7 +441,7 @@ def _aggregate_player_counts(events):
         # pressing
         'pressures':              is_press.astype('int32'),
         'pressures_successful':   pressure_success.astype('int32'),
-        # offensif
+        # attacking
         'shots':                  is_shot.astype('int32'),
         'shots_on_target':        shot_on_target.astype('int32'),
         'xG':                     xg.astype('float64'),
@@ -501,14 +449,14 @@ def _aggregate_player_counts(events):
         'dribbles_attempted':     is_dribble.astype('int32'),
         'dribbles_completed':     dribble_complete.astype('int32'),
         'shots_first_touch':      shots_first_touch.astype('int32'),
-        # passes/carries additionnelles
+        # extra passing / progression
         'crosses':                crosses.astype('int32'),
         'switches':               switches.astype('int32'),
         'passes_into_penalty_area':  passes_into_box.astype('int32'),
         'carries_into_penalty_area': carries_into_box.astype('int32'),
-        # actions défensives totales
+        # aggregate defensive output
         'defensive_actions':      defensive_actions.astype('int32'),
-        # général
+        # general
         'touches':                is_touch.astype('int32'),
         'fouls_committed':        is_foul_committed.astype('int32'),
         'fouls_won':              is_foul_won.astype('int32'),
@@ -516,23 +464,21 @@ def _aggregate_player_counts(events):
         'miscontrols':            is_miscontrol.astype('int32'),
     })
 
-    # On ne somme que pour les events avec player_id
+    # Sum only events with a known player_id
     work = work.dropna(subset=['player_id'])
-    agg = work.groupby('player_id', observed=True).sum(numeric_only=True)
-    return agg
+    return work.groupby('player_id', observed=True).sum(numeric_only=True)
 
 
 def _player_meta(events):
-    """Récupère nom + équipe(s) principale(s) par joueur.
+    """Return the most-frequent name and team per player.
 
     Args:
-        events (pd.DataFrame): events enrichis.
+        events: Enriched events.
 
     Returns:
-        pd.DataFrame: ``player_id, player_name, team``.
+        DataFrame with columns ``player_id, player_name, team``.
     """
     df = events.dropna(subset=['player_id', 'player']).copy()
-    # Nom le plus fréquent (orthographe canonique)
     name = (
         df.groupby(['player_id', 'player'], observed=True).size()
           .rename('n').reset_index()
@@ -552,26 +498,25 @@ def _player_meta(events):
 
 
 # ---------------------------------------------------------------------------
-# Calcul des taux et normalisation per 90
+# Rates + per-90 normalisation
 # ---------------------------------------------------------------------------
 
 def _finalize(agg, minutes_per_player, meta, positions):
-    """Combine comptes bruts + minutes + meta et calcule les taux/per90.
+    """Combine raw counts + minutes + meta, then compute rates and per-90.
 
     Args:
-        agg (pd.DataFrame): sommes brutes par player_id (sortie de
-            :func:`_aggregate_player_counts`).
-        minutes_per_player (pd.Series): minutes totales par player_id.
-        meta (pd.DataFrame): nom + équipe par player_id.
-        positions (pd.DataFrame): position dominante par player_id.
+        agg: Raw per-player sums (output of :func:`_aggregate_player_counts`).
+        minutes_per_player: Total season minutes per player_id.
+        meta: Player name + team per player_id.
+        positions: Dominant position per player_id.
 
     Returns:
-        pd.DataFrame: table finale prête à être écrite.
+        Final, ready-to-write feature table.
     """
     df = agg.copy()
     df['minutes_total'] = minutes_per_player.reindex(df.index).fillna(0.0)
 
-    # --- Taux (avant per90 — ce sont des ratios, pas des per90)
+    # --- Rates (these are ratios, NOT per-90 quantities)
     def _safe_div(a, b):
         return np.where(b > 0, a / np.where(b == 0, 1, b), np.nan)
 
@@ -587,7 +532,7 @@ def _finalize(agg, minutes_per_player, meta, positions):
     df['xG_per_shot'] = _safe_div(df['xG'], df['shots'])
     df['dribble_success_rate'] = _safe_div(df['dribbles_completed'], df['dribbles_attempted'])
 
-    # --- Normalisation per 90
+    # --- Per-90 normalisation (count columns only; rates and minutes excluded)
     rate_cols = {
         'pass_completion_rate', 'long_pass_completion_rate',
         'pass_completion_under_pressure', 'aerial_duel_win_rate',
@@ -602,16 +547,15 @@ def _finalize(agg, minutes_per_player, meta, positions):
 
     out = pd.concat([df, p90], axis=1).reset_index()
 
-    # Meta + positions
+    # Attach metadata
     out = out.merge(meta, on='player_id', how='left')
     out = out.merge(positions, on='player_id', how='left')
 
-    # Filtre temps de jeu
+    # Filter: minutes threshold + drop goalkeepers / unmappable positions
     out = out[out['minutes_total'] >= MIN_MINUTES].copy()
-    # On exclut les gardiens et les joueurs sans groupe mappable
     out = out[out['position_group'].notna()].copy()
 
-    # Réorganisation : meta d'abord
+    # Reorder: metadata first
     front = ['player_id', 'player_name', 'team',
              'position_group', 'position_raw', 'minutes_total']
     front = [c for c in front if c in out.columns]
@@ -624,7 +568,7 @@ def _finalize(agg, minutes_per_player, meta, positions):
 # Orchestration
 # ---------------------------------------------------------------------------
 
-# Colonnes vraiment utiles pour le calcul (réduction mémoire ~5x)
+# Columns actually used downstream (~5x memory reduction at load time)
 _USED_COLUMNS = [
     'id', 'match_id', 'period', 'minute', 'second',
     'type', 'team', 'player', 'player_id', 'position',
@@ -642,36 +586,33 @@ _USED_COLUMNS = [
 
 
 def _process_file(path):
-    """Traite un fichier events parquet en isolation mémoire.
+    """Process one events parquet file in memory isolation.
 
-    Lit un seul fichier, ne conserve que :data:`_USED_COLUMNS`, prépare les
-    events, puis retourne les agrégats partiels (minutes par match, comptes
-    par joueur, positions, meta).
+    Reads a single file with only :data:`_USED_COLUMNS`, prepares the
+    events, and returns partial aggregates (minutes per match, counts per
+    player, position counts, name/team counts).
 
     Args:
-        path (str): chemin vers un ``events_*.parquet``.
+        path: Path to one ``events_*.parquet``.
 
     Returns:
-        dict: ``{minutes, agg, positions_counts, meta_counts}`` où chaque
-        valeur est un DataFrame déjà groupé/sommé pour ce fichier.
+        Dict ``{minutes, agg, positions_counts, meta_counts}`` of partial
+        DataFrames, ready to be combined across files.
     """
     df = pd.read_parquet(path, columns=_USED_COLUMNS)
     df = _prepare_events(df)
 
-    # Minutes par (match, player)
     minutes = compute_minutes(df)
-
-    # Counts par player_id pour CE fichier
     agg = _aggregate_player_counts(df)
 
-    # Position : on remonte les COMPTES par (player_id, position) pour fusion ultérieure
+    # Position counts per (player_id, position) — merged across files later
     pos_df = df.dropna(subset=['player_id', 'position'])
     pos_counts = (
         pos_df.groupby(['player_id', 'position'], observed=True)
               .size().rename('n').reset_index()
     )
 
-    # Meta (nom + équipe) : comptes par (player_id, player, team)
+    # Meta counts per (player_id, player, team)
     meta_df = df.dropna(subset=['player_id', 'player'])
     meta_counts = (
         meta_df.groupby(['player_id', 'player', 'team'], observed=True)
@@ -687,13 +628,13 @@ def _process_file(path):
 
 
 def _reduce_positions(pos_counts):
-    """Réduit les comptes de positions multi-fichiers en position dominante.
+    """Reduce multi-file position counts to a dominant position per player.
 
     Args:
-        pos_counts (pd.DataFrame): colonnes ``player_id, position, n``.
+        pos_counts: Columns ``player_id, position, n``.
 
     Returns:
-        pd.DataFrame: ``player_id, position_group, position_raw``.
+        DataFrame with columns ``player_id, position_group, position_raw``.
     """
     pos_counts = pos_counts.copy()
     pos_counts['position_group'] = pos_counts['position'].map(POSITION_MAP)
@@ -715,13 +656,13 @@ def _reduce_positions(pos_counts):
 
 
 def _reduce_meta(meta_counts):
-    """Réduit les comptes (player_id, player, team) en nom + équipe principale.
+    """Reduce multi-file (player_id, player, team) counts to one row per player.
 
     Args:
-        meta_counts (pd.DataFrame): colonnes ``player_id, player, team, n``.
+        meta_counts: Columns ``player_id, player, team, n``.
 
     Returns:
-        pd.DataFrame: ``player_id, player_name, team``.
+        DataFrame with columns ``player_id, player_name, team``.
     """
     name = (
         meta_counts.groupby(['player_id', 'player'], as_index=False)['n'].sum()
@@ -738,32 +679,32 @@ def _reduce_meta(meta_counts):
 
 
 def build_features(raw_dir=DATA_RAW, output_dir=DATA_PROCESSED):
-    """Construit la table de features joueurs et la sauvegarde en parquet.
+    """Build the per-player feature table and save it as parquet.
 
-    Pour rester dans une enveloppe mémoire raisonnable (~6M events au total),
-    chaque fichier ``events_{cid}_{sid}.parquet`` est traité séparément :
-    les agrégats partiels (minutes, comptes par joueur, comptes positions,
-    comptes nom/équipe) sont ensuite réduits via somme.
+    To stay within a reasonable memory envelope (~6M events total in 2015/16),
+    each ``events_{cid}_{sid}.parquet`` file is processed independently; the
+    partial aggregates (minutes, counts, positions, meta) are then summed
+    across files.
 
-    Étapes :
-        1. Pour chaque fichier events_*.parquet : ``_process_file``.
-        2. Agrège minutes -> total minutes par joueur.
-        3. Agrège counts par joueur -> sommes par player_id.
-        4. Réduit positions et meta en valeur dominante.
-        5. Calcule taux + per90, filtre >= MIN_MINUTES, sauvegarde.
+    Steps:
+        1. For each ``events_*.parquet`` file: :func:`_process_file`.
+        2. Sum minutes → total minutes per player.
+        3. Sum counts → final per-player sums.
+        4. Reduce positions and meta to dominant values.
+        5. Compute rates + per-90, filter ≥ ``MIN_MINUTES``, save.
 
     Args:
-        raw_dir (str): répertoire contenant ``events_*.parquet``.
-        output_dir (str): répertoire de sortie pour le parquet processed.
+        raw_dir: Directory containing ``events_*.parquet``.
+        output_dir: Destination directory for the processed parquet.
 
     Returns:
-        pd.DataFrame: la table de features finale.
+        The final feature DataFrame.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     files = sorted(glob.glob(os.path.join(raw_dir, 'events_*.parquet')))
     if not files:
-        raise FileNotFoundError(f'Aucun events_*.parquet dans {raw_dir}')
+        raise FileNotFoundError(f'No events_*.parquet in {raw_dir}')
 
     all_minutes, all_agg = [], []
     all_pos_counts, all_meta_counts = [], []
@@ -776,7 +717,7 @@ def build_features(raw_dir=DATA_RAW, output_dir=DATA_PROCESSED):
         all_pos_counts.append(part['positions_counts'])
         all_meta_counts.append(part['meta_counts'])
 
-    print('[reduce] Fusion des agrégats partiels...', flush=True)
+    print('[reduce] Combining partial aggregates ...', flush=True)
     minutes_total = (
         pd.concat(all_minutes, ignore_index=True)
           .groupby('player_id', observed=True)['minutes_match'].sum()
@@ -785,13 +726,13 @@ def build_features(raw_dir=DATA_RAW, output_dir=DATA_PROCESSED):
     positions = _reduce_positions(pd.concat(all_pos_counts, ignore_index=True))
     meta = _reduce_meta(pd.concat(all_meta_counts, ignore_index=True))
 
-    print(f'[finalize] Taux + per90 + filtre >= {MIN_MINUTES} min...', flush=True)
+    print(f'[finalize] Rates + per-90 + filter ≥ {MIN_MINUTES} min ...', flush=True)
     out = _finalize(agg, minutes_total, meta, positions)
 
     output_path = os.path.join(output_dir, 'player_features.parquet')
     out.to_parquet(output_path, index=False)
-    print(f'[DONE] {len(out)} joueurs retenus -> {output_path}')
-    print(f'       {len(out.columns)} colonnes.')
+    print(f'[DONE] {len(out)} players retained -> {output_path}')
+    print(f'       {len(out.columns)} columns.')
     return out
 
 
