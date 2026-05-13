@@ -275,6 +275,12 @@ def plot_custom_radar(player_name, custom_weights, position=None,
     if not resolved:
         raise ValueError('None of the supplied metrics could be resolved '
                          'against the dataset.')
+    if len(resolved) < 3:
+        raise ValueError(
+            f'plot_custom_radar needs at least 3 resolved metrics to draw '
+            f'a meaningful polygon, got {len(resolved)}: {list(resolved)}. '
+            f'Add more weighted metrics to custom_weights.'
+        )
 
     cols = list(resolved.keys())
     player_vec = norm_df.loc[target['player_id'], cols].to_numpy(dtype='float64')

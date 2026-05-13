@@ -88,7 +88,19 @@ results = rank_players_by_role(
 print(results.head(10))
 ```
 
-See `notebooks/04_demo.ipynb` for full use case demonstrations.
+## Notebooks
+
+Five notebooks walk through the pipeline from raw data to scouting use cases.
+All of them resolve paths relative to the project root via `pathlib`, so they
+run unchanged on any machine.
+
+| Notebook | Purpose | Typical runtime |
+|---|---|---|
+| `00_check_data.ipynb` | Browse the StatsBomb open-data catalogue and pick competitions / seasons. | < 1 min |
+| `01_extraction.ipynb` | Download the raw event and lineup parquets to `data/raw/`. Idempotent — re-running skips files already present. | ≈ 30–60 min on a fresh clone |
+| `02_features.ipynb` | Exploratory analysis of the per-player feature table: position-conditioned distributions, correlations, most discriminative metrics. | < 30 s |
+| `03_clustering.ipynb` | Visualise the data-driven clusters of every position group — PCA scatter, cluster-profile heat-maps, representative players. Validates the link between unsupervised clusters and the YAML role taxonomy. | < 1 min |
+| `04_demo.ipynb` | Six scouting use cases — including the custom-role mechanism (UC5) and three documented framework limitations (UC6). This is the chapter-6 deliverable. | ≈ 1–2 min |
 
 ## Visual Examples
 
@@ -130,11 +142,12 @@ tb-football-scouting-framework/
 │   ├── raw/                  ← StatsBomb raw events (auto-generated)
 │   └── processed/            ← Cleaned player feature matrices
 ├── notebooks/
-│   ├── 00_check_data.ipynb   ← Verify StatsBomb availability
-│   ├── 01_exploration.ipynb  ← Data exploration
-│   ├── 02_features.ipynb     ← Feature engineering development
-│   ├── 03_clustering.ipynb   ← PCA + K-Means development
-│   └── 04_demo.ipynb         ← Use case demonstrations (Chapter 6)
+│   ├── 00_check_data.ipynb   ← Verify StatsBomb availability + pick competitions
+│   ├── 01_extraction.ipynb   ← Run the StatsBomb event download (≈ 45 min once)
+│   ├── 02_features.ipynb     ← EDA of the per-player feature table
+│   ├── 03_clustering.ipynb   ← Full walkthrough of the per-position clusters
+│   └── 04_demo.ipynb         ← Six use cases demonstrating the framework
+│                                (chapter 6 of the thesis)
 ├── src/
 │   ├── __init__.py
 │   ├── extraction.py         ← Data extraction pipeline
@@ -151,9 +164,11 @@ tb-football-scouting-framework/
 
 ## Role Catalogue
 
-Roles are inspired by Football Manager 2026 archetypes, translated into
+Roles are inspired by the Football Manager role taxonomy, translated into
 quantifiable StatsBomb metrics. Each role is defined as a weighted combination
-of metrics in `config/role_profiles.yaml`.
+of metrics in `config/role_profiles.yaml`. The catalogue can also be bypassed
+entirely via `matching.custom_role_search`, which accepts any user-defined
+weight dictionary (see `04_demo.ipynb`, use case 5).
 
 | Position | Roles |
 |----------|-------|
