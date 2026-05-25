@@ -1237,6 +1237,234 @@ def custom_role_search(position, custom_weights, min_minutes=450, top=20,
 
 
 # ---------------------------------------------------------------------------
+# Public API: percentile_threshold_search
+# ---------------------------------------------------------------------------
+
+# Category labels used by percentile_threshold_search. Order matters: the
+# separator-row machinery in the returned DataFrame follows it.
+_MATCH_FULL    = 'full_match'
+_MATCH_NEAR    = 'near_match'
+_MATCH_PARTIAL = 'partial_match'
+_MATCH_SEP     = '---'   # marker for the visual separator rows
+
+
+def _classify_match(player_pct_per_metric, thresholds_per_metric,
+                    near_miss_tolerance):
+    """Decide the category of one player against a set of percentile thresholds.
+
+    Args:
+        player_pct_per_metric: ``{metric: percentile}`` — the player's
+            percentile rank on each thresholded metric.
+        thresholds_per_metric: ``{metric: threshold_percentile}``.
+        near_miss_tolerance: Max gap (in percentile points) below a
+            threshold for that miss to still count as "near".
+
+    Returns:
+        Tuple ``(category, n_met, gaps)`` where ``gaps`` is a dict
+        ``{metric: positive_gap}`` for the metrics the player failed,
+        and ``category`` is one of :data:`_MATCH_FULL`, :data:`_MATCH_NEAR`,
+        :data:`_MATCH_PARTIAL`, or ``None`` if the player is below the
+        partial-match threshold (half of the criteria met).
+    """
+    met, gaps = 0, {}
+    for m, thr in thresholds_per_metric.items():
+        pct = player_pct_per_metric.get(m, 0.0)
+        if pct >= thr:
+            met += 1
+        else:
+            gaps[m] = thr - pct
+
+    n = len(thresholds_per_metric)
+    missed = n - met
+
+    if missed == 0:
+        return _MATCH_FULL, met, gaps
+    if missed == 1 and next(iter(gaps.values())) < near_miss_tolerance:
+        return _MATCH_NEAR, met, gaps
+    # Partial: at least half the criteria met (and not full/near)
+    if met * 2 >= n:
+        return _MATCH_PARTIAL, met, gaps
+    return None, met, gaps
+
+
+def percentile_threshold_search(position, thresholds, min_minutes=450,
+                                 near_miss_tolerance=10,
+                                 include_adjacent=False,
+                                 include_positions=None):
+    """Filter players by per-metric percentile thresholds, tiered by match quality.
+
+    This is the framework's *constraint-based* search entry point — instead
+    of weighting metrics into a single score (as :func:`rank_players_by_role`
+    does), the analyst expresses a *minimum-bar* on each metric. The
+    output is tiered into three categories:
+
+    * **full_match** — every threshold is met (player percentile ≥ threshold
+      on every metric).
+    * **near_match** — exactly one threshold is missed by less than
+      ``near_miss_tolerance`` percentile points. These are the "almost-fits"
+      that a flexible recruiter should consider alongside full matches.
+    * **partial_match** — at least half the thresholds are met but the
+      player does not qualify as full or near match.
+
+    Players who meet fewer than half the thresholds are excluded.
+
+    The proximity score sorts players within a category:
+    * **full_match**: mean percentile rank over the threshold metrics.
+    * **near_match / partial_match**: mean percentile rank minus the
+      summed gaps to the missed thresholds — so a player who misses a
+      threshold by 25 points is penalised twice as heavily as one who
+      misses by 12.
+
+    Supports the same cross-position search options as
+    :func:`rank_players_by_role` via ``include_adjacent`` and
+    ``include_positions``; when the pool spans multiple position groups
+    the percentile ranks are recomputed on the combined population.
+
+    Args:
+        position: Nominal position code (CB, FB, MF, AM, ST).
+        thresholds: Dict ``{metric_name: percentile_threshold}`` in [0, 100].
+            E.g. ``{'aerial_duel_win_rate': 80}`` requires the player to be
+            in the top 20% of his position on that metric.
+        min_minutes: Minimum minutes-played threshold.
+        near_miss_tolerance: Max gap (in percentile points) below a single
+            threshold for a player to still qualify as ``near_match``.
+            Defaults to 10.
+        include_adjacent: If True, expand the scoring pool with adjacent
+            positions per :data:`ADJACENT_POSITIONS`.
+        include_positions: Optional iterable of extra position codes.
+
+    Returns:
+        DataFrame with columns ``player_name, team, position_group,
+        minutes_total, match_category, n_met, proximity_score`` plus one
+        column per threshold metric (the player's percentile rank).
+        Rows are concatenated in the order full → near → partial, each
+        block internally sorted by ``proximity_score`` descending, with
+        a visible separator row between blocks (``match_category == '---'``
+        and a labelled ``player_name`` like ``"═══ NEAR MATCH (12) ═══"``).
+    """
+    if not isinstance(thresholds, dict) or not thresholds:
+        raise ValueError('thresholds must be a non-empty dict '
+                         '{metric_name: percentile_threshold}.')
+    if any(not (0 <= v <= 100) for v in thresholds.values()):
+        raise ValueError('All threshold percentiles must lie in [0, 100].')
+
+    df, _ = _load_data()
+    if position not in {'CB', 'FB', 'MF', 'AM', 'ST'}:
+        raise ValueError(f'position must be one of CB/FB/MF/AM/ST, '
+                         f'got {position!r}.')
+
+    # Resolve the scoring pool (default = single position, optionally extended)
+    available_positions = set(df['position_group'].dropna().unique())
+    pool_positions = _resolve_position_pool(position, include_adjacent,
+                                             include_positions,
+                                             available_positions)
+
+    if len(pool_positions) == 1:
+        pct_df, all_cols = _get_percentile_ranks(position)
+    else:
+        pct_df, all_cols = _get_percentile_ranks_combined(pool_positions)
+
+    # Resolve YAML-style metric names against actual parquet columns
+    resolved_thresholds = {}
+    missing = []
+    for m, thr in thresholds.items():
+        col = _resolve_metric(m, all_cols)
+        if col is None:
+            missing.append(m)
+        else:
+            resolved_thresholds[col] = float(thr)
+    if missing:
+        print(f'[warn] percentile_threshold_search: dropped unknown '
+              f'metric(s) — {missing}')
+    if not resolved_thresholds:
+        raise ValueError('None of the supplied thresholds could be resolved '
+                         'against the dataset. Use list_available_metrics('
+                         f'{position!r}) to inspect available names.')
+
+    # Pool of candidates
+    pool = df[(df['position_group'].isin(pool_positions))
+              & (df['minutes_total'] >= min_minutes)].copy()
+
+    if len(pool_positions) > 1:
+        extras = sorted(set(pool_positions) - {position})
+        n_native = int((pool['position_group'] == position).sum())
+        n_extra = len(pool) - n_native
+        _safe_print(
+            f'[info] cross-position search: native {position} '
+            f'+ {extras} ({n_extra} extra players, {len(pool)} total scored). '
+            f'Percentile ranks recomputed on the combined population.'
+        )
+
+    threshold_cols = list(resolved_thresholds.keys())
+    n_thresholds = len(threshold_cols)
+    rows = []
+    for _, p in pool.iterrows():
+        pid = p['player_id']
+        if pid not in pct_df.index:
+            continue
+        pcts = {c: float(pct_df.loc[pid, c]) for c in threshold_cols}
+        category, n_met, gaps = _classify_match(
+            pcts, resolved_thresholds, near_miss_tolerance)
+        if category is None:
+            continue
+        mean_pct = sum(pcts.values()) / n_thresholds
+        if category == _MATCH_FULL:
+            proximity = mean_pct
+        else:
+            # Penalise by the cumulative shortfall below thresholds
+            proximity = mean_pct - sum(gaps.values())
+        row = {
+            'player_name':     p['player_name'],
+            'team':            p['team'],
+            'position_group':  p['position_group'],
+            'minutes_total':   p['minutes_total'],
+            'match_category':  category,
+            'n_met':           f'{n_met}/{n_thresholds}',
+            'proximity_score': round(proximity, 2),
+        }
+        for c in threshold_cols:
+            row[_display_name(c)] = round(pcts[c], 1)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            'player_name', 'team', 'position_group', 'minutes_total',
+            'match_category', 'n_met', 'proximity_score',
+        ] + [_display_name(c) for c in threshold_cols])
+
+    body = pd.DataFrame(rows)
+
+    # Sort each category by proximity_score desc and concatenate
+    blocks = []
+    for cat, label in [
+        (_MATCH_FULL,    'FULL MATCH'),
+        (_MATCH_NEAR,    'NEAR MATCH'),
+        (_MATCH_PARTIAL, 'PARTIAL MATCH'),
+    ]:
+        chunk = (body[body['match_category'] == cat]
+                 .sort_values('proximity_score', ascending=False)
+                 .reset_index(drop=True))
+        if chunk.empty:
+            continue
+        blocks.append(chunk)
+        # Separator row inserted AFTER each block except the last
+        separator = {col: pd.NA for col in chunk.columns}
+        separator['player_name']    = f'═══ {label} ({len(chunk)}) ═══'
+        separator['match_category'] = _MATCH_SEP
+        blocks.append(pd.DataFrame([separator]))
+
+    # Drop the trailing separator (we want separators *between* blocks only)
+    if blocks and (blocks[-1]['match_category'] == _MATCH_SEP).all():
+        blocks = blocks[:-1]
+
+    out = pd.concat(blocks, ignore_index=True)
+    out.attrs['pool_positions']      = pool_positions
+    out.attrs['thresholds']          = dict(resolved_thresholds)
+    out.attrs['near_miss_tolerance'] = near_miss_tolerance
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI demo
 # ---------------------------------------------------------------------------
 

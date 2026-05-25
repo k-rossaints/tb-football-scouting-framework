@@ -691,6 +691,220 @@ def plot_player_card(player_name, role_name, save_path=None, position=None):
 
 
 # ---------------------------------------------------------------------------
+# Threshold-search results table
+# ---------------------------------------------------------------------------
+
+# Category background colours — light tints to keep cell text readable
+_CATEGORY_BG = {
+    'full_match':    '#d4f4d4',   # light green
+    'near_match':    '#ffe0b3',   # light orange
+    'partial_match': '#cfe2ff',   # light blue
+}
+_CATEGORY_BG_DARK = {
+    'full_match':    '#2ca02c',
+    'near_match':    '#ff8c00',
+    'partial_match': '#1f6fc4',
+}
+
+
+def plot_threshold_results(results_df, thresholds, position, save_path=None,
+                            near_miss_tolerance=10, max_rows=30):
+    """Render the output of :func:`matching.percentile_threshold_search` as a
+    colour-coded matplotlib table.
+
+    Each player row is shaded according to its match category (green / orange
+    / blue for full / near / partial). Each threshold-metric cell is then
+    overlaid with a stronger cue:
+
+    * **bold green** if the player meets the threshold,
+    * **orange** if the player is within ``near_miss_tolerance`` percentile
+      points below the threshold,
+    * **red** if the player is further below.
+
+    The column header carries the threshold value, so the reader can see
+    immediately what bar the player had to clear.
+
+    Args:
+        results_df: DataFrame returned by
+            :func:`matching.percentile_threshold_search`.
+        thresholds: The original ``{metric: threshold}`` dict (used to
+            read the threshold values back; the function also accepts a
+            dict whose keys are already resolved parquet column names).
+        position: Position code, used only in the figure title.
+        save_path: PNG path (relative paths resolve under ``results/``).
+        near_miss_tolerance: Must match the value used when calling
+            ``percentile_threshold_search`` for the cell colours to align
+            with the row categories. Defaults to 10.
+        max_rows: Cap the number of body rows displayed (defaults to 30).
+            Separator rows do not count towards the cap.
+
+    Returns:
+        The matplotlib Figure object.
+    """
+    # Resolve the user-supplied threshold keys to the display names used in
+    # the results DataFrame (matching's _display_name handles negative metrics).
+    df_pool, _ = _m._load_data()
+    pool_positions = results_df.attrs.get('pool_positions', (position,))
+    if len(pool_positions) > 1:
+        _, all_cols = _m._get_percentile_ranks_combined(pool_positions)
+    else:
+        _, all_cols = _m._get_percentile_ranks(position)
+    threshold_display = {}
+    for m, thr in thresholds.items():
+        col = _m._resolve_metric(m, all_cols)
+        if col is None:
+            continue
+        threshold_display[_m._display_name(col)] = float(thr)
+
+    # Trim to displayable rows (respect separator rows for visual structure)
+    body = results_df.copy()
+    real_rows_mask = body['match_category'].isin(
+        ['full_match', 'near_match', 'partial_match'])
+    # Cap real rows at max_rows while preserving separators
+    keep = []
+    seen = 0
+    for i, row in body.iterrows():
+        if row['match_category'] == '---':
+            keep.append(i)
+        elif seen < max_rows:
+            keep.append(i)
+            seen += 1
+    body = body.loc[keep].reset_index(drop=True)
+
+    metric_cols = list(threshold_display.keys())
+
+    # Compact category label for the in-cell badge
+    _short_cat = {'full_match': 'FULL', 'near_match': 'NEAR',
+                  'partial_match': 'PART'}
+
+    # Shorter metric labels via _pretty_metric (handles negative-metric
+    # aliases, /90 / %, abbreviations) — then add the threshold reference
+    # on a wrapped second line so the header is compact and legible.
+    def _wrap_metric_label(m):
+        return f'{_pretty_metric(m)}\n(≥ {threshold_display[m]:.0f})'
+
+    headers = ['#', 'Player', 'Team', 'Cat.', 'Met', 'Prox.'] + [
+        _wrap_metric_label(m) for m in metric_cols
+    ]
+
+    # Build cell strings
+    text_rows = []
+    rank_counter = 0
+    for _, row in body.iterrows():
+        if row['match_category'] == '---':
+            label = str(row['player_name'])
+            text_rows.append([''] + [label] + [''] * (len(headers) - 2))
+            continue
+        rank_counter += 1
+        cells = [
+            f'{rank_counter}',
+            str(row['player_name']),
+            str(row['team']),
+            _short_cat.get(row['match_category'], row['match_category']),
+            str(row['n_met']),
+            f'{row["proximity_score"]:.1f}',
+        ]
+        for m in metric_cols:
+            v = row.get(m, float('nan'))
+            cells.append(f'{v:.0f}' if pd.notna(v) else '—')
+        text_rows.append(cells)
+
+    # Figure size — generous per-metric width so headers don't overlap
+    fig_w = 6.5 + 2.0 * len(metric_cols)
+    fig_h = max(3.5, 0.50 * len(text_rows) + 1.6)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=DPI / 3)
+    fig.patch.set_facecolor('white')
+    ax.set_axis_off()
+
+    n_cols = len(headers)
+    # Column widths — name/team wider, metric columns generous so the
+    # wrapped header + threshold annotation fit comfortably
+    fixed_widths = [0.025, 0.165, 0.135, 0.060, 0.040, 0.055]
+    metric_w     = max(0.090, (1.0 - sum(fixed_widths)) / max(1, len(metric_cols)))
+    col_widths   = fixed_widths + [metric_w] * len(metric_cols)
+    s = sum(col_widths)
+    col_widths = [w / s for w in col_widths]
+
+    table = ax.table(cellText=text_rows, colLabels=headers,
+                     loc='center', cellLoc='center', colWidths=col_widths)
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    # Slightly taller cells so the wrapped 2-line header has room
+    table.scale(1.0, 1.7)
+    # Header row needs a bit more height for the two-line labels
+    for j in range(n_cols):
+        table[0, j].set_height(table[0, j].get_height() * 1.3)
+
+    # Header row
+    for j in range(n_cols):
+        cell = table[0, j]
+        cell.set_facecolor('#2f4858')
+        cell.set_text_props(color='white', fontweight='bold')
+
+    # Body rows
+    for i, src_row in enumerate(body.itertuples()):
+        cat = getattr(src_row, 'match_category')
+        if cat == '---':
+            # Separator row — merge visually by colouring the whole row dark
+            for j in range(n_cols):
+                cell = table[i + 1, j]
+                cell.set_facecolor('#34495e')
+                cell.set_text_props(color='white', fontweight='bold',
+                                    fontsize=10, ha='center')
+                cell.set_edgecolor('#34495e')
+            continue
+
+        bg = _CATEGORY_BG.get(cat, 'white')
+        for j in range(n_cols):
+            cell = table[i + 1, j]
+            cell.set_facecolor(bg)
+            cell.set_edgecolor('#dddddd')
+        # Left-align name and team
+        table[i + 1, 1].set_text_props(ha='left')
+        table[i + 1, 2].set_text_props(ha='left')
+
+        # Strong colour on the category column
+        cat_cell = table[i + 1, 3]
+        cat_cell.set_facecolor(_CATEGORY_BG_DARK.get(cat, '#888888'))
+        cat_cell.set_text_props(color='white', fontweight='bold', fontsize=8)
+
+        # Metric cells: green if met, orange if near, red if far below
+        for k, m in enumerate(metric_cols):
+            col_idx = 6 + k
+            cell = table[i + 1, col_idx]
+            v = getattr(src_row, m.replace(' ', '_'), None)
+            # Workaround: column names may contain symbols; access via dict
+            v = body.iloc[i][m] if m in body.columns else float('nan')
+            if pd.isna(v):
+                continue
+            thr = threshold_display[m]
+            if v >= thr:
+                cell.set_facecolor('#2ca02c')
+                cell.set_text_props(color='white', fontweight='bold')
+            elif thr - v < near_miss_tolerance:
+                cell.set_facecolor('#ffb454')
+                cell.set_text_props(color='black', fontweight='bold')
+            else:
+                cell.set_facecolor('#e57373')
+                cell.set_text_props(color='white')
+
+    pool_label = '+'.join(pool_positions) if len(pool_positions) > 1 else position
+    ax.set_title(
+        f'Threshold search — {pool_label}  '
+        f'({len(threshold_display)} criteria, near-miss tolerance = '
+        f'{near_miss_tolerance} pct)',
+        fontsize=13, fontweight='bold', pad=14,
+    )
+
+    path = _resolve_path(save_path)
+    if path:
+        fig.savefig(path, dpi=DPI, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        print(f'[saved] {path}')
+    return fig
+
+
+# ---------------------------------------------------------------------------
 # CLI demo
 # ---------------------------------------------------------------------------
 
