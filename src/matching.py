@@ -72,6 +72,21 @@ NEGATIVE_DISPLAY_ALIAS = {
     'fouls_committed_p90': 'discipline_p90',
 }
 
+# Tactical adjacency graph between position groups. Used by the
+# cross-position search mechanism in :func:`rank_players_by_role` and
+# :func:`custom_role_search` to surface players whose position label is
+# different from the role's nominal position but whose statistical
+# signature might still match. The graph is symmetric (CB↔FB, FB↔MF,
+# MF↔AM, AM↔ST) and intentionally non-transitive — a CB is not adjacent
+# to a MF, only via FB.
+ADJACENT_POSITIONS = {
+    'ST': ['AM'],
+    'AM': ['ST', 'MF'],
+    'MF': ['AM', 'FB'],
+    'FB': ['MF', 'CB'],
+    'CB': ['FB'],
+}
+
 # Metric categories — used by :func:`list_available_metrics` so a user
 # building a custom role profile can browse what is available. Membership
 # is by metric *stem* (no _p90 suffix); the categoriser checks both forms.
@@ -148,6 +163,7 @@ _CACHE = {
     'profiles': None,
     'norm': {},        # position -> (MinMax-normalised DataFrame, columns)
     'pct': {},         # position -> (percentile rank 0-100 DataFrame, columns)
+    'pct_combined': {},# frozenset(positions) -> combined pct DataFrame
     'warned': set(),   # role/metric pairs already reported as missing
 }
 
@@ -176,6 +192,7 @@ def reset_cache():
     _CACHE['profiles'] = None
     _CACHE['norm'] = {}
     _CACHE['pct'] = {}
+    _CACHE['pct_combined'] = {}
     _CACHE['warned'] = set()
 
 
@@ -378,6 +395,45 @@ def _get_percentile_ranks(position):
     return pct, cols
 
 
+def _get_percentile_ranks_combined(positions):
+    """Return (and cache) percentile-rank table over a *combined* position pool.
+
+    Mirrors :func:`_get_percentile_ranks` exactly, but the population over
+    which percentiles are computed is the union of multiple position groups.
+    Used by the cross-position search mode of :func:`rank_players_by_role`
+    and :func:`custom_role_search`: an AM-tagged player can be ranked
+    against ST role weights only if his percentile is defined within the
+    *combined* (AM ∪ ST) population — otherwise the score is meaningless.
+
+    Negative metrics are inverted ``100 - pct`` exactly as in the per-
+    position variant, so consumers can treat the table uniformly as
+    "higher = better".
+
+    Args:
+        positions: Iterable of position codes to merge (e.g. ``('AM', 'ST')``).
+
+    Returns:
+        Tuple ``(DataFrame indexed by player_id, list of columns)``.
+    """
+    key = frozenset(positions)
+    if key in _CACHE['pct_combined']:
+        return _CACHE['pct_combined'][key]
+
+    df, _ = _load_data()
+    sub = df[df['position_group'].isin(positions)].copy()
+    cols = _feature_columns(df)
+    raw = sub[cols].astype('float64').fillna(0.0)
+    pct = raw.rank(pct=True, method='average') * 100.0
+    pct.index = sub['player_id'].to_numpy()
+
+    for col in NEGATIVE_METRICS:
+        if col in pct.columns:
+            pct[col] = 100.0 - pct[col]
+
+    _CACHE['pct_combined'][key] = (pct, cols)
+    return pct, cols
+
+
 def _ideal_vector(position, columns):
     """Reference vector at :data:`IDEAL_PERCENTILE` of each MinMax-normalised
     metric — used as the dashed reference polygon on radar charts.
@@ -396,6 +452,76 @@ def _ideal_vector(position, columns):
 # ---------------------------------------------------------------------------
 # Matching score
 # ---------------------------------------------------------------------------
+
+def _score_from_pct(player_id, role_weights, pct_df, all_cols, role_name='?'):
+    """Compute the weighted-percentile role score from a pre-built pct table.
+
+    Internal helper shared by :func:`compute_matching_score` (per-position
+    cache) and the cross-position code paths of :func:`rank_players_by_role`
+    and :func:`custom_role_search` (combined-pool cache). The scoring
+    formula is identical in both cases — only the population over which
+    the percentiles are computed differs.
+
+    Args:
+        player_id: Player identifier (index of ``pct_df``).
+        role_weights: YAML / user weights for the role.
+        pct_df: Percentile-rank table (output of
+            :func:`_get_percentile_ranks` or
+            :func:`_get_percentile_ranks_combined`).
+        all_cols: List of all metric columns available in ``pct_df``.
+        role_name: Role name, forwarded to warnings.
+
+    Returns:
+        Score ∈ [0, 100].
+    """
+    weights = _resolved_weights(role_weights, all_cols, role_name=role_name)
+    if not weights:
+        return 0.0
+    cols = list(weights.keys())
+    w = np.array([weights[c] for c in cols], dtype='float64')
+    if player_id not in pct_df.index:
+        return 0.0
+    player_pct = pct_df.loc[player_id, cols].to_numpy(dtype='float64')
+    wsum = w.sum()
+    if wsum <= 0:
+        return 0.0
+    score = float(np.dot(player_pct, w) / wsum)
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _strengths_weaknesses_from_pct(player_id, role_weights, pct_df, all_cols,
+                                   role_name='?'):
+    """Strengths/weaknesses computation from a pre-built pct table.
+
+    Identical to :func:`_strengths_weaknesses` but operates directly on
+    a supplied ``pct_df`` — used by the cross-position code paths.
+    """
+    weights = _resolved_weights(role_weights, all_cols, role_name=role_name)
+    if not weights:
+        return [], []
+    cols = list(weights.keys())
+    if player_id not in pct_df.index:
+        return [], []
+    player_pct = pct_df.loc[player_id, cols].to_numpy(dtype='float64')
+    w = np.array([weights[c] for c in cols], dtype='float64')
+
+    pv = player_pct / 100.0
+    iv = np.full_like(pv, IDEAL_PERCENTILE / 100.0)
+
+    strength_score = pv * w
+    s_order = np.argsort(-strength_score)
+    strengths = [
+        (cols[i], float(strength_score[i]), float(pv[i]), float(iv[i]))
+        for i in s_order[:TOP_STRENGTHS] if pv[i] >= 0.60
+    ]
+    weakness_score = (1.0 - pv) * w
+    w_order = np.argsort(-weakness_score)
+    weaknesses = [
+        (cols[i], float(weakness_score[i]), float(pv[i]), float(iv[i]))
+        for i in w_order[:TOP_WEAKNESSES] if pv[i] <= 0.50
+    ]
+    return strengths, weaknesses
+
 
 def compute_matching_score(player_row, role_weights, all_players_df,
                            role_name='?'):
@@ -424,24 +550,8 @@ def compute_matching_score(player_row, role_weights, all_players_df,
     """
     position = player_row['position_group']
     pct_df, all_cols = _get_percentile_ranks(position)
-
-    weights = _resolved_weights(role_weights, all_cols, role_name=role_name)
-    if not weights:
-        return 0.0
-
-    cols = list(weights.keys())
-    w = np.array([weights[c] for c in cols], dtype='float64')
-
-    pid = player_row['player_id']
-    if pid not in pct_df.index:
-        return 0.0
-
-    player_pct = pct_df.loc[pid, cols].to_numpy(dtype='float64')
-    wsum = w.sum()
-    if wsum <= 0:
-        return 0.0
-    score = float(np.dot(player_pct, w) / wsum)
-    return round(max(0.0, min(100.0, score)), 2)
+    return _score_from_pct(player_row['player_id'], role_weights,
+                            pct_df, all_cols, role_name=role_name)
 
 
 def _strengths_weaknesses(player_row, role_weights, role_name='?'):
@@ -473,35 +583,42 @@ def _strengths_weaknesses(player_row, role_weights, role_name='?'):
     """
     position = player_row['position_group']
     pct_df, all_cols = _get_percentile_ranks(position)
-    weights = _resolved_weights(role_weights, all_cols, role_name=role_name)
-    if not weights:
-        return [], []
+    return _strengths_weaknesses_from_pct(
+        player_row['player_id'], role_weights, pct_df, all_cols,
+        role_name=role_name)
 
-    cols = list(weights.keys())
-    pid = player_row['player_id']
-    if pid not in pct_df.index:
-        return [], []
 
-    player_pct = pct_df.loc[pid, cols].to_numpy(dtype='float64')  # 0..100
-    w = np.array([weights[c] for c in cols], dtype='float64')
+# ---------------------------------------------------------------------------
+# Cross-position search helper
+# ---------------------------------------------------------------------------
 
-    pv = player_pct / 100.0
-    iv = np.full_like(pv, IDEAL_PERCENTILE / 100.0)
+def _resolve_position_pool(position, include_adjacent, include_positions,
+                            available_positions):
+    """Build the position set for a (possibly cross-position) search.
 
-    strength_score = pv * w
-    s_order = np.argsort(-strength_score)
-    strengths = [
-        (cols[i], float(strength_score[i]), float(pv[i]), float(iv[i]))
-        for i in s_order[:TOP_STRENGTHS] if pv[i] >= 0.60
-    ]
+    Args:
+        position: The role's nominal position group.
+        include_adjacent: If True, add the positions adjacent to
+            ``position`` per :data:`ADJACENT_POSITIONS`.
+        include_positions: Iterable of extra position codes to include.
+        available_positions: Set of valid position codes (used to reject
+            invalid user input early).
 
-    weakness_score = (1.0 - pv) * w
-    w_order = np.argsort(-weakness_score)
-    weaknesses = [
-        (cols[i], float(weakness_score[i]), float(pv[i]), float(iv[i]))
-        for i in w_order[:TOP_WEAKNESSES] if pv[i] <= 0.50
-    ]
-    return strengths, weaknesses
+    Returns:
+        Sorted tuple of position codes covering the final scoring pool.
+    """
+    pool = {position}
+    if include_adjacent:
+        pool.update(ADJACENT_POSITIONS.get(position, []))
+    if include_positions:
+        bad = [p for p in include_positions if p not in available_positions]
+        if bad:
+            raise ValueError(
+                f'Invalid position code(s) in include_positions: {bad}. '
+                f'Valid codes: {sorted(available_positions)}'
+            )
+        pool.update(include_positions)
+    return tuple(sorted(pool))
 
 
 # ---------------------------------------------------------------------------
@@ -509,8 +626,22 @@ def _strengths_weaknesses(player_row, role_weights, role_name='?'):
 # ---------------------------------------------------------------------------
 
 def rank_players_by_role(role_name, position, min_minutes=450, top=20,
-                         verbose=True):
+                         verbose=True, include_adjacent=False,
+                         include_positions=None):
     """Rank every player of a position by their role-match score.
+
+    Supports a **cross-position search mode**: by default the scoring pool
+    is restricted to the role's nominal ``position``, but ``include_adjacent``
+    and/or ``include_positions`` extend it to neighbouring or arbitrary
+    extra position groups. When the pool spans more than one position,
+    percentile ranks are recomputed on the *combined* population so that
+    every scored player is benchmarked against the same reference — which
+    is what makes the cross-position comparison meaningful.
+
+    Use case: surfacing wingers (AM-tagged) when scoring against an ST
+    role like ``poacher``. A pure-finisher Left-Wing player (e.g. CR7 in
+    2015/16) is structurally invisible to a single-position ST search but
+    appears immediately once AM is added to the pool.
 
     Args:
         role_name: Role key in the YAML (e.g. ``deep_lying_playmaker``).
@@ -519,10 +650,18 @@ def rank_players_by_role(role_name, position, min_minutes=450, top=20,
         top: How many players to detail in the printed output.
         verbose: If True, also print the strengths/weaknesses of the top
             ``top`` players.
+        include_adjacent: If True, expand the scoring pool with the
+            positions adjacent to ``position`` per
+            :data:`ADJACENT_POSITIONS`. Defaults to False.
+        include_positions: Optional iterable of extra position codes to
+            include in the scoring pool. Combined (union) with
+            ``include_adjacent``.
 
     Returns:
-        DataFrame with columns ``player_name, team, minutes_total, score,
-        cluster, role_label``, sorted by ``score`` descending.
+        DataFrame with columns ``player_name, team, position_group,
+        minutes_total, score, cluster, role_label``, sorted by ``score``
+        descending. The ``position_group`` column is always included
+        (useful in cross-position mode and harmless otherwise).
     """
     df, profiles = _load_data()
     if position not in profiles:
@@ -533,33 +672,61 @@ def rank_players_by_role(role_name, position, min_minutes=450, top=20,
                        f'Available: {list(profiles[position])}')
 
     role_weights = profiles[position][role_name]
-    pool = df[(df['position_group'] == position)
-              & (df['minutes_total'] >= min_minutes)].copy()
+
+    # Resolve the scoring pool (default = single position, optionally extended)
+    available_positions = set(df['position_group'].dropna().unique())
+    pool_positions = _resolve_position_pool(position, include_adjacent,
+                                             include_positions,
+                                             available_positions)
+
+    if len(pool_positions) == 1:
+        # Default single-position scoring — uses the cached per-position
+        # percentile ranks via compute_matching_score / _strengths_weaknesses.
+        pool = df[(df['position_group'] == position)
+                  & (df['minutes_total'] >= min_minutes)].copy()
+        pct_df, all_cols = _get_percentile_ranks(position)
+    else:
+        # Cross-position scoring — recompute percentiles on the combined pool
+        pct_df, all_cols = _get_percentile_ranks_combined(pool_positions)
+        pool = df[(df['position_group'].isin(pool_positions))
+                  & (df['minutes_total'] >= min_minutes)].copy()
+        extras = sorted(set(pool_positions) - {position})
+        n_native = int((pool['position_group'] == position).sum())
+        n_extra = len(pool) - n_native
+        _safe_print(
+            f'[info] cross-position search: native {position} '
+            f'+ {extras} ({n_extra} extra players, {len(pool)} total scored). '
+            f'Percentile ranks recomputed on the combined population.'
+        )
 
     pool['score'] = pool.apply(
-        lambda r: compute_matching_score(r, role_weights, df, role_name=role_name),
+        lambda r: _score_from_pct(r['player_id'], role_weights,
+                                   pct_df, all_cols, role_name=role_name),
         axis=1,
     )
-    out = (pool[['player_name', 'team', 'minutes_total', 'score',
-                 'cluster', 'role_label']]
+    out = (pool[['player_name', 'team', 'position_group', 'minutes_total',
+                 'score', 'cluster', 'role_label']]
            .sort_values('score', ascending=False)
            .reset_index(drop=True))
 
     if verbose:
-        print(f'\n=== {position} / {role_name} — top {top} players ===')
+        pool_label = '+'.join(pool_positions) if len(pool_positions) > 1 else position
+        print(f'\n=== {pool_label} / {role_name} — top {top} players ===')
         for i, row in out.head(top).iterrows():
             try:
                 line = (f'{i+1:2d}. {row["player_name"]:<35s} '
                         f'{row["team"]:<25s} '
                         f'{row["minutes_total"]:6.0f}min  '
-                        f'score={row["score"]:.2f}  [{row["role_label"]}]')
+                        f'score={row["score"]:.2f}  '
+                        f'[{row["position_group"]}|{row["role_label"]}]')
             except (TypeError, ValueError):
                 line = f'{i+1:2d}. score={row["score"]:.2f}'
             _safe_print(line)
 
             player_row = pool[pool['player_name'] == row['player_name']].iloc[0]
-            strengths, weaknesses = _strengths_weaknesses(
-                player_row, role_weights, role_name=role_name)
+            strengths, weaknesses = _strengths_weaknesses_from_pct(
+                player_row['player_id'], role_weights, pct_df, all_cols,
+                role_name=role_name)
             if strengths:
                 _safe_print('     [+] ' + ' | '.join(
                     f'{_display_name(m)} ({pv:.2f} vs {iv:.2f})'
@@ -569,6 +736,7 @@ def rank_players_by_role(role_name, position, min_minutes=450, top=20,
                     f'{_display_name(m)} ({pv:.2f} vs {iv:.2f})'
                     for m, _, pv, iv in weaknesses))
 
+    out.attrs['pool_positions'] = pool_positions
     return out
 
 
@@ -936,7 +1104,8 @@ def _format_metric_tuples(items):
 
 
 def custom_role_search(position, custom_weights, min_minutes=450, top=20,
-                       verbose=True):
+                       verbose=True, include_adjacent=False,
+                       include_positions=None):
     """Rank every player of a position against a user-defined role profile.
 
     Unlike :func:`rank_players_by_role`, the weights are supplied directly
@@ -952,6 +1121,11 @@ def custom_role_search(position, custom_weights, min_minutes=450, top=20,
     the analyst can see *why* a player is ranked where they are without
     a follow-up call.
 
+    Supports the same **cross-position search mode** as
+    :func:`rank_players_by_role` via ``include_adjacent`` and
+    ``include_positions``. When the pool spans multiple position groups,
+    percentile ranks are recomputed on the combined population.
+
     Args:
         position: Position code (CB, FB, MF, AM, ST).
         custom_weights: Dict ``{metric_name: weight}``. Names accept
@@ -961,12 +1135,18 @@ def custom_role_search(position, custom_weights, min_minutes=450, top=20,
         min_minutes: Minimum minutes-played threshold.
         top: How many players to detail in the printed output.
         verbose: If True, print the top-N to stdout.
+        include_adjacent: If True, expand the scoring pool with the
+            positions adjacent to ``position`` per
+            :data:`ADJACENT_POSITIONS`. Defaults to False.
+        include_positions: Optional iterable of extra position codes to
+            include in the scoring pool.
 
     Returns:
         DataFrame sorted by score descending, with columns:
-        ``player_name, team, minutes_total, score, cluster, role_label,
-        strengths, weaknesses``. Strengths/weaknesses are compact strings
-        like ``"progressive_passes_p90 (94p) | xA_p90 (87p)"`` where the
+        ``player_name, team, position_group, minutes_total, score,
+        cluster, role_label, strengths, weaknesses``. Strengths/weaknesses
+        are compact strings like
+        ``"progressive_passes_p90 (94p) | xA_p90 (87p)"`` where the
         number is the player's percentile rank for that metric.
     """
     if not isinstance(custom_weights, dict) or not custom_weights:
@@ -978,41 +1158,63 @@ def custom_role_search(position, custom_weights, min_minutes=450, top=20,
         raise ValueError(f'position must be one of CB/FB/MF/AM/ST, '
                          f'got {position!r}.')
 
-    # Validate weights against the available columns of this position
-    _, all_cols = _get_percentile_ranks(position)
-    resolved = _resolved_weights(custom_weights, all_cols,
-                                 role_name='custom')
+    # Resolve the scoring pool (default = single position, optionally extended)
+    available_positions = set(df['position_group'].dropna().unique())
+    pool_positions = _resolve_position_pool(position, include_adjacent,
+                                             include_positions,
+                                             available_positions)
+
+    if len(pool_positions) == 1:
+        pct_df, all_cols = _get_percentile_ranks(position)
+    else:
+        pct_df, all_cols = _get_percentile_ranks_combined(pool_positions)
+
+    # Validate weights against the available columns
+    resolved = _resolved_weights(custom_weights, all_cols, role_name='custom')
     if not resolved:
         raise ValueError('None of the supplied metrics could be resolved '
                          'against the dataset. Use list_available_metrics('
                          f'{position!r}) to inspect available names.')
 
-    pool = df[(df['position_group'] == position)
+    pool = df[(df['position_group'].isin(pool_positions))
               & (df['minutes_total'] >= min_minutes)].copy()
 
+    if len(pool_positions) > 1:
+        extras = sorted(set(pool_positions) - {position})
+        n_native = int((pool['position_group'] == position).sum())
+        n_extra = len(pool) - n_native
+        _safe_print(
+            f'[info] cross-position search: native {position} '
+            f'+ {extras} ({n_extra} extra players, {len(pool)} total scored). '
+            f'Percentile ranks recomputed on the combined population.'
+        )
+
     pool['score'] = pool.apply(
-        lambda r: compute_matching_score(r, custom_weights, df,
-                                         role_name='custom'),
+        lambda r: _score_from_pct(r['player_id'], custom_weights,
+                                   pct_df, all_cols, role_name='custom'),
         axis=1,
     )
 
-    # Compute strengths/weaknesses per row
+    # Compute strengths/weaknesses per row from the (possibly combined) pct_df
     strengths_list, weaknesses_list = [], []
     for _, row in pool.iterrows():
-        s, w = _strengths_weaknesses(row, custom_weights, role_name='custom')
+        s, w = _strengths_weaknesses_from_pct(row['player_id'], custom_weights,
+                                                pct_df, all_cols,
+                                                role_name='custom')
         strengths_list.append(_format_metric_tuples(s) if s else '—')
         weaknesses_list.append(_format_metric_tuples(w) if w else '—')
     pool['strengths'] = strengths_list
     pool['weaknesses'] = weaknesses_list
 
-    out = (pool[['player_name', 'team', 'minutes_total', 'score',
-                 'cluster', 'role_label', 'strengths', 'weaknesses']]
+    out = (pool[['player_name', 'team', 'position_group', 'minutes_total',
+                 'score', 'cluster', 'role_label', 'strengths', 'weaknesses']]
            .sort_values('score', ascending=False)
            .reset_index(drop=True))
 
     if verbose:
         sorted_weights = dict(sorted(resolved.items(), key=lambda kv: -kv[1]))
-        print(f'\n=== {position} / custom profile — top {top} players ===')
+        pool_label = '+'.join(pool_positions) if len(pool_positions) > 1 else position
+        print(f'\n=== {pool_label} / custom profile — top {top} players ===')
         print(f'    Weights: {sorted_weights}')
         for i, row in out.head(top).iterrows():
             try:
@@ -1020,7 +1222,8 @@ def custom_role_search(position, custom_weights, min_minutes=450, top=20,
                     f'{i+1:2d}. {row["player_name"]:<35s} '
                     f'{row["team"]:<25s} '
                     f'{row["minutes_total"]:6.0f}min  '
-                    f'score={row["score"]:5.2f}  [{row["role_label"]}]'
+                    f'score={row["score"]:5.2f}  '
+                    f'[{row["position_group"]}|{row["role_label"]}]'
                 )
             except (TypeError, ValueError):
                 _safe_print(f'{i+1:2d}. score={row["score"]:5.2f}')
@@ -1029,6 +1232,7 @@ def custom_role_search(position, custom_weights, min_minutes=450, top=20,
             if row['weaknesses'] != '—':
                 _safe_print(f'     [-] {row["weaknesses"]}')
 
+    out.attrs['pool_positions'] = pool_positions
     return out
 
 
