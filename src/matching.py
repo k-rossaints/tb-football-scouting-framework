@@ -576,12 +576,41 @@ def rank_players_by_role(role_name, position, min_minutes=450, top=20,
 # Public API: find_similar_players
 # ---------------------------------------------------------------------------
 
-def find_similar_players(player_name, position=None, top_n=10):
+def find_similar_players(player_name, position=None, top_n=10,
+                         role=None, use_role_metrics=True):
     """Find the players whose statistical signature most resembles the target.
 
-    Similarity is the cosine similarity computed on the **full** intra-
-    position MinMax-normalised metric vector — no role weighting is applied
-    here. This is a role-agnostic, data-driven neighbourhood search.
+    Two similarity measures are used, picked automatically:
+
+    * **Role-filtered modes** (``use_role_metrics=True`` with a role) use a
+      **weighted absolute-difference distance on percentile ranks** (a
+      weighted Manhattan / L1 metric). For each role metric, the absolute
+      gap in percentile rank between the target and the candidate is
+      multiplied by the role weight; the per-metric contributions are
+      summed and folded back to a [0, 100] scale via
+      ``similarity = 100 − Σ(w_i × |target_pct_i − cand_pct_i|) / Σ(w_i)``.
+      A weighted-L1 measure is more discriminative than cosine in this
+      setting: cosine compresses positive-only vectors into a narrow score
+      band, whereas L1 penalises every percentile-point gap proportionally
+      to its tactical weight.
+    * **Full-metric mode** (``use_role_metrics=False``) uses the legacy
+      **cosine similarity** on the intra-position MinMax-normalised
+      feature vector. This is appropriate when no specific tactical role
+      is in mind.
+
+    Three operational modes follow from those two measures:
+
+    1. ``use_role_metrics=True`` (default) **with** ``role`` supplied —
+       weighted-L1 distance on the metrics that define this role in
+       ``role_profiles.yaml``. Example: similar deep-lying playmakers to
+       Verratti, not similar midfielders in general.
+
+    2. ``use_role_metrics=True`` (default) **without** ``role`` — the role
+       is inferred as the target's natural role (highest score from
+       :func:`profile_player`), then the same weighted-L1 distance is used.
+
+    3. ``use_role_metrics=False`` — cosine on the full feature set,
+       role-agnostic neighbourhood search.
 
     Args:
         player_name: Name (or fragment) of the target player. Search is
@@ -589,13 +618,22 @@ def find_similar_players(player_name, position=None, top_n=10):
         position: If given, restrict the target to that position group
             (useful for disambiguating homonyms). Otherwise inferred.
         top_n: Number of neighbours to return.
+        role: Role key in the YAML (e.g. ``deep_lying_playmaker``). If
+            supplied and ``use_role_metrics`` is True, the cosine is
+            restricted to this role's metrics. Must belong to the target's
+            position group.
+        use_role_metrics: Whether to restrict the similarity computation to
+            a role's metric subset. Defaults to True.
 
     Returns:
         DataFrame with columns ``player_name, team, position_group,
         minutes_total, similarity, role_label``, sorted by similarity
-        descending. ``similarity`` is reported as a 0-100 percentage.
+        descending. ``similarity`` is reported on a 0–100 scale. The
+        ``attrs`` of the returned DataFrame carry the metadata
+        ``role_used``, ``n_metrics`` and ``similarity_kind`` (one of
+        ``'weighted_l1_percentile'`` or ``'cosine_minmax'``).
     """
-    df, _ = _load_data()
+    df, profiles = _load_data()
     mask = _name_match(df['player_name'], player_name)
     if position is not None:
         mask &= df['position_group'] == position
@@ -604,7 +642,6 @@ def find_similar_players(player_name, position=None, top_n=10):
         raise KeyError(f'No player matches "{player_name}"'
                        + (f' (position={position})' if position else ''))
     if len(candidates) > 1:
-        # Disambiguate homonyms by picking the one with the most minutes
         target = candidates.sort_values('minutes_total', ascending=False).iloc[0]
         _safe_print(f'[info] multiple matches ({len(candidates)}), '
                     f'selected "{target["player_name"]}" ({target["team"]})')
@@ -612,20 +649,78 @@ def find_similar_players(player_name, position=None, top_n=10):
         target = candidates.iloc[0]
 
     pos = target['position_group']
-    norm_df, cols = _get_normalized(pos)
+    norm_df, all_cols = _get_normalized(pos)
 
-    target_vec = norm_df.loc[target['player_id'], cols].to_numpy(dtype='float64')
-    target_norm = np.linalg.norm(target_vec)
-    if target_norm == 0:
-        return pd.DataFrame()
+    # ------ Pick the metric subset for the cosine -------------------------
+    # Default: full metric set ("legacy" behaviour, role-agnostic).
+    cols = list(all_cols)
+    role_used = None
 
-    # Vectorised cosine: M @ target / (||M|| * ||target||)
-    M = norm_df[cols].to_numpy(dtype='float64')
-    norms = np.linalg.norm(M, axis=1)
-    norms[norms == 0] = 1.0
-    sims = (M @ target_vec) / (norms * target_norm)
+    if use_role_metrics:
+        if role is None:
+            # Auto-detect the target's natural role
+            prof = profile_player(target['player_name'], position=pos,
+                                   verbose=False)
+            if not prof.empty:
+                role = prof.iloc[0]['role_name']
+        if role is not None:
+            if pos not in profiles or role not in profiles[pos]:
+                raise KeyError(f'Role "{role}" not defined for position '
+                               f'{pos}. Available: '
+                               f'{list(profiles.get(pos, {}))}')
+            resolved = _resolved_weights(profiles[pos][role], all_cols,
+                                          role_name=role)
+            if resolved:
+                cols = list(resolved.keys())
+                role_used = role
+                _safe_print(
+                    f'[info] similarity restricted to {len(cols)} metric(s) '
+                    f'of role "{role}" '
+                    f'(use_role_metrics=False to fall back to full metric set)'
+                )
 
-    sim_series = pd.Series(sims, index=norm_df.index, name='similarity')
+    # ------ Similarity computation ---------------------------------------
+    # Two modes:
+    #   - Role-filtered: weighted absolute-difference distance on percentile
+    #     ranks (a.k.a. weighted Manhattan / L1). Penalises every percentile-
+    #     point gap proportionally to the role weight, then folds back to a
+    #     [0, 100] similarity scale via ``100 - normalised distance``.
+    #   - Role-agnostic fallback: cosine on the full MinMax-normalised
+    #     feature vector (the legacy behaviour).
+    #
+    # The L1 choice is intentional: cosine on positive-only vectors is
+    # direction-only and tends to compress scores into a narrow band;
+    # weighted L1 on percentile ranks gives genuine point-by-point
+    # comparison and is more discriminative, especially when the target
+    # player saturates a heavily-weighted metric the candidate does not.
+    if role_used is not None:
+        pct_df, _ = _get_percentile_ranks(pos)
+        weight_vec = np.array([resolved[c] for c in cols], dtype='float64')
+        w_sum = weight_vec.sum()
+        if w_sum <= 0:
+            return pd.DataFrame()
+
+        target_pct = pct_df.loc[target['player_id'], cols].to_numpy(dtype='float64')
+        M_pct = pct_df[cols].to_numpy(dtype='float64')
+        # Weighted L1: Σ(w_i × |target_pct_i − candidate_pct_i|)
+        abs_diffs = np.abs(M_pct - target_pct)
+        distances = (abs_diffs * weight_vec).sum(axis=1)
+        # Normalise: max single-axis diff is 100, so max distance = 100 × Σw
+        # → fold to a [0, 100] similarity ("100 − normalised distance").
+        sims = 100.0 - distances / w_sum
+        # Index is already aligned on player_id via pct_df
+        sim_series = pd.Series(sims, index=pct_df.index, name='similarity')
+    else:
+        target_vec = norm_df.loc[target['player_id'], cols].to_numpy(dtype='float64')
+        target_norm = np.linalg.norm(target_vec)
+        if target_norm == 0:
+            return pd.DataFrame()
+        M = norm_df[cols].to_numpy(dtype='float64')
+        norms = np.linalg.norm(M, axis=1)
+        norms[norms == 0] = 1.0
+        sims = (M @ target_vec) / (norms * target_norm) * 100.0
+        sim_series = pd.Series(sims, index=norm_df.index, name='similarity')
+
     pos_df = df[df['position_group'] == pos].set_index('player_id')
     out = (pos_df.join(sim_series)
                  .reset_index()
@@ -633,9 +728,15 @@ def find_similar_players(player_name, position=None, top_n=10):
                    'minutes_total', 'similarity', 'role_label']]
                  .sort_values('similarity', ascending=False))
 
-    # Drop the target itself and scale to 0-100
+    # Drop the target itself and round the similarity column
     out = out[out['player_name'] != target['player_name']].head(top_n).reset_index(drop=True)
-    out['similarity'] = (out['similarity'] * 100).round(2)
+    out['similarity'] = out['similarity'].round(2)
+    # Stamp context onto the DataFrame attrs for downstream inspection
+    out.attrs['role_used'] = role_used
+    out.attrs['n_metrics'] = len(cols)
+    out.attrs['similarity_kind'] = ('weighted_l1_percentile'
+                                     if role_used is not None
+                                     else 'cosine_minmax')
     return out
 
 
