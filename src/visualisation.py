@@ -125,11 +125,19 @@ def _role_normalized_values(player_row, role_weights, role_name='?'):
 def _pretty_metric(name):
     """Turn a raw column name into a human-readable label.
 
+    For negative metrics (e.g. ``dispossessed_p90``) the
+    :data:`matching.NEGATIVE_DISPLAY_ALIAS` is applied first so that the
+    axis represents the *quality* on which the percentile-inversion is
+    based (e.g. ``ball_retention_p90`` → "Ball Retention /90"). The radar
+    therefore reads "higher = better" uniformly on every axis.
+
     Examples:
         ``progressive_passes_p90`` -> ``Prog. Passes /90``
         ``pass_completion_rate``   -> ``Pass Compl. %``
+        ``dispossessed_p90``       -> ``Ball Retention /90`` (after alias)
     """
-    s = name
+    # Apply the negative-metric display alias if applicable
+    s = _m.NEGATIVE_DISPLAY_ALIAS.get(name, name)
     s = s.replace('_p90', ' /90')
     s = s.replace('_rate', ' %')
     s = s.replace('_', ' ')

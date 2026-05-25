@@ -51,6 +51,27 @@ _ALIASES = {
     'dribbles_success_rate': 'dribble_success_rate',
 }
 
+# Metrics where a HIGH raw value represents a defect, not a quality.
+# Their percentile ranks are inverted at intra-position normalisation time
+# (`100 - pct`) so that downstream code can treat *every* metric as
+# "higher = better" uniformly. The visualisation layer relabels them via
+# :data:`NEGATIVE_DISPLAY_ALIAS` so that radars and tooltips read naturally
+# (e.g. "ball_retention_p90" instead of "dispossessed_p90").
+NEGATIVE_METRICS = [
+    'dispossessed_p90',
+    'miscontrols_p90',
+    'fouls_committed_p90',
+]
+
+# Display-side rename for negative metrics: after inversion the underlying
+# quantity measures the *quality* (low dispossession → high ball retention).
+# This mapping is consumed by visualisation._pretty_metric to relabel axes.
+NEGATIVE_DISPLAY_ALIAS = {
+    'dispossessed_p90':    'ball_retention_p90',
+    'miscontrols_p90':     'ball_control_p90',
+    'fouls_committed_p90': 'discipline_p90',
+}
+
 # Metric categories — used by :func:`list_available_metrics` so a user
 # building a custom role profile can browse what is available. Membership
 # is by metric *stem* (no _p90 suffix); the categoriser checks both forms.
@@ -168,11 +189,13 @@ def _resolve_metric(name, df_columns):
     Resolution order:
         1. The name as-is.
         2. An explicit alias from :data:`_ALIASES`.
-        3. Suffix substitution ``_per90 -> _p90``.
-        4. Suffix substitution ``_p90 -> _per90`` (reverse).
+        3. The display alias of a negative metric, reversed
+           (e.g. ``ball_retention_p90`` -> ``dispossessed_p90``).
+        4. Suffix substitution ``_per90 -> _p90``.
+        5. Suffix substitution ``_p90 -> _per90`` (reverse).
 
     Args:
-        name: Metric name as written in the YAML.
+        name: Metric name as written in the YAML or supplied by the user.
         df_columns: Available columns in the DataFrame.
 
     Returns:
@@ -183,6 +206,11 @@ def _resolve_metric(name, df_columns):
         return name
     if name in _ALIASES and _ALIASES[name] in cols:
         return _ALIASES[name]
+    # Reverse-lookup the display alias of a negative metric so a caller
+    # can pass either ``dispossessed_p90`` or ``ball_retention_p90``.
+    for orig, alias in NEGATIVE_DISPLAY_ALIAS.items():
+        if name == alias and orig in cols:
+            return orig
     if name.endswith('_per90'):
         cand = name[:-len('_per90')] + '_p90'
         if cand in cols:
@@ -192,6 +220,17 @@ def _resolve_metric(name, df_columns):
         if cand in cols:
             return cand
     return None
+
+
+def _display_name(col):
+    """Return the user-facing label for a (possibly negative) metric column.
+
+    For negative metrics this is the entry in :data:`NEGATIVE_DISPLAY_ALIAS`;
+    for every other column it is the column name itself. Used by
+    ``compare_players`` and the visualisation layer so that tables and
+    plots read as "higher = better" uniformly.
+    """
+    return NEGATIVE_DISPLAY_ALIAS.get(col, col)
 
 
 def _resolved_weights(role_weights, df_columns, role_name='?'):
@@ -260,14 +299,18 @@ def _feature_columns(df):
 def _get_normalized(position):
     """Return (and cache) the MinMax-normalised matrix for one position.
 
-    Used by similarity search and radar charts.
+    Used by similarity search and radar charts. Negative metrics (those
+    listed in :data:`NEGATIVE_METRICS`) are **inverted** here so that the
+    radar polygon, which maps "high value → outer ring", still represents
+    a *quality* on every axis regardless of the underlying metric's
+    semantic direction.
 
     Args:
         position: Position code (CB, FB, MF, AM, ST).
 
     Returns:
         Tuple ``(DataFrame indexed by player_id, list of columns)``,
-        values ∈ [0, 1].
+        values ∈ [0, 1] — uniformly "higher = better".
     """
     if position in _CACHE['norm']:
         return _CACHE['norm'][position]
@@ -280,6 +323,11 @@ def _get_normalized(position):
     Xn = MinMaxScaler().fit_transform(X)
     norm_df = pd.DataFrame(Xn, index=sub['player_id'].to_numpy(), columns=cols)
 
+    # Flip negative metrics so 1.0 still means "best on this dimension"
+    for col in NEGATIVE_METRICS:
+        if col in norm_df.columns:
+            norm_df[col] = 1.0 - norm_df[col]
+
     _CACHE['norm'][position] = (norm_df, cols)
     return norm_df, cols
 
@@ -288,17 +336,26 @@ def _get_percentile_ranks(position):
     """Return (and cache) the percentile-rank table for one position.
 
     Used by the matching score. Each value is the player's rank on that
-    metric within the position population, expressed in [0, 100]:
-        - 100 → best player at the position on that metric
+    metric within the position population, expressed in [0, 100], with a
+    uniform "higher = better" semantic:
+        - 100 → best player at the position on this *quality*
         - 50  → median
         - 0   → worst
+
+    For metrics where the raw quantity is a defect (those listed in
+    :data:`NEGATIVE_METRICS`), the percentile is inverted (``100 - pct``).
+    Concretely, a player who is rarely dispossessed will land at a high
+    percentile on ``dispossessed_p90`` — i.e. high *ball retention*. This
+    means every downstream consumer (scoring, strengths/weaknesses,
+    compare_players) can treat percentile ranks uniformly without having
+    to know which metrics are inverted.
 
     Args:
         position: Position code (CB, FB, MF, AM, ST).
 
     Returns:
         Tuple ``(DataFrame indexed by player_id, list of columns)``,
-        values ∈ [0, 100].
+        values ∈ [0, 100], uniformly "higher = better".
     """
     if position in _CACHE['pct']:
         return _CACHE['pct'][position]
@@ -311,6 +368,11 @@ def _get_percentile_ranks(position):
     # rank(pct=True) returns percentiles in (0, 1]; ties handled via average.
     pct = raw.rank(pct=True, method='average') * 100.0
     pct.index = sub['player_id'].to_numpy()
+
+    # Invert negative metrics so every column is "higher = better"
+    for col in NEGATIVE_METRICS:
+        if col in pct.columns:
+            pct[col] = 100.0 - pct[col]
 
     _CACHE['pct'][position] = (pct, cols)
     return pct, cols
@@ -500,11 +562,11 @@ def rank_players_by_role(role_name, position, min_minutes=450, top=20,
                 player_row, role_weights, role_name=role_name)
             if strengths:
                 _safe_print('     [+] ' + ' | '.join(
-                    f'{m} ({pv:.2f} vs {iv:.2f})'
+                    f'{_display_name(m)} ({pv:.2f} vs {iv:.2f})'
                     for m, _, pv, iv in strengths))
             if weaknesses:
                 _safe_print('     [-] ' + ' | '.join(
-                    f'{m} ({pv:.2f} vs {iv:.2f})'
+                    f'{_display_name(m)} ({pv:.2f} vs {iv:.2f})'
                     for m, _, pv, iv in weaknesses))
 
     return out
@@ -714,6 +776,10 @@ def compare_players(player1_name, player2_name, position, metrics=None,
     })
     out['diff'] = (out[c1] - out[c2]).round(1)
     out = out.reindex(out['diff'].abs().sort_values(ascending=False).index)
+
+    # Relabel negative metrics with their display alias so the table reads
+    # "higher = better" uniformly (e.g. ball_retention_p90, not dispossessed_p90).
+    out.index = [_display_name(c) for c in out.index]
     out.index.name = 'metric'
     return out
 
@@ -758,8 +824,14 @@ def list_available_metrics(position):
 # ---------------------------------------------------------------------------
 
 def _format_metric_tuples(items):
-    """Format a list of ``(metric, _, pv, _)`` tuples as a compact string."""
-    return ' | '.join(f'{m} ({pv * 100:.0f}p)' for m, _, pv, _ in items)
+    """Format a list of ``(metric, _, pv, _)`` tuples as a compact string.
+
+    Negative metrics are relabelled via :data:`NEGATIVE_DISPLAY_ALIAS` so
+    that the textual output reads as a quality on every line.
+    """
+    return ' | '.join(
+        f'{_display_name(m)} ({pv * 100:.0f}p)' for m, _, pv, _ in items
+    )
 
 
 def custom_role_search(position, custom_weights, min_minutes=450, top=20,
